@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: traffic_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminpassword
+      POSTGRES_DB: traffic
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    container_name: traffic_pipeline
+    environment:
+      - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
+      - ROBOFLOW_API_KEY=${ROBOFLOW_API_KEY}
+    volumes:
+      # Map the local downloads folder so the test video is accessible inside Docker
+      - /Users/shivaniyerram/Downloads:/app/downloads
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:

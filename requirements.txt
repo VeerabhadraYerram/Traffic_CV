@@ -1,0 +1,6 @@
+supervision
+opencv-python-headless
+psycopg2-binary
+SQLAlchemy
+python-dotenv
+inference
