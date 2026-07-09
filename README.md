@@ -1,16 +1,38 @@
-# Production Vehicle Access Logging System
+# VigilantEye — ANPR & Traffic CV System
 
-A scalable, on-premise computer vision system designed to monitor vehicle entries and exits, perform Automatic License Plate Recognition (ALPR), and reliably log timestamped data into a PostgreSQL database.
-
-This project uses an advanced **YOLO11 + DeepSORT + EasyOCR** computer vision stack running concurrently across multiple video feeds, and leverages a Temporal Consensus Algorithm to eliminate motion blur and ensure high-accuracy license plate reads.
+VigilantEye is an enterprise-grade real-time system for traffic monitoring, vehicle tracking, and violation analytics. It consists of a high-performance computer vision pipeline and an interactive web control center.
 
 ---
 
-## 🏗️ Architecture Overview
+## 🏗️ System Architecture
 
-The system is designed for 100% on-premise, air-gapped deployment capability (no cloud API keys required) and consists of two core Docker containers:
-1. **Database Container (`traffic_db`)**: A PostgreSQL 15 database that manages camera configurations and access logs.
-2. **Pipeline Container (`traffic_pipeline`)**: A multi-threaded Python application utilizing **YOLO11m** (for vehicle detection), **DeepSORT** (for vehicle tracking), and **EasyOCR** (for plate reading) to process video feeds.
+The system is designed for 100% on-premise, air-gapped deployment capability (no cloud API keys required) and consists of three core components:
+
+1. **Computer Vision Pipeline (`traffic_pipeline`)**: A multi-threaded Python application utilizing **YOLO11m** (for vehicle detection), **DeepSORT** (for vehicle tracking), and **EasyOCR** (for plate reading) to process video feeds.
+2. **Database (`traffic_db`)**: A PostgreSQL 15 database that manages camera configurations and access logs.
+3. **Web Analytics Dashboard (`dashboard`)**: A low-latency web control center with live event feeds, geospatial vehicle tracking, and historical analytics.
+
+```mermaid
+graph TD
+    A[CCTV / RTSP Feed] --> B[YOLO11 + DeepSORT]
+    B --> C[EasyOCR ALPR]
+    C --> D[Temporal Consensus Algorithm]
+    D --> E[(PostgreSQL Database)]
+    E --> F[Appwrite Sync]
+    F --> G[React Web Dashboard]
+```
+
+---
+
+## 📊 Dashboard Preview
+
+Here is a preview of the interactive web control center:
+
+![VigilantEye Dashboard Interface](dashboard/playwright_verified_light_mode.png)
+
+---
+
+## 📹 Part 1: Computer Vision Pipeline & Infrastructure
 
 ### Core Features
 - **Zero Cloud Dependency**: Completely local execution. No API keys, no credit limits, no internet requirement.
@@ -18,33 +40,24 @@ The system is designed for 100% on-premise, air-gapped deployment capability (no
 - **Database-Driven Configuration**: Camera video sources, roles, and crossing lines are fetched dynamically from Postgres. No need to touch Python code to add a new gate.
 - **Temporal ALPR Consensus**: Instead of saving messy, single-frame OCR reads, the pipeline accumulates all plate readings for a given tracking ID and calculates the statistical **mode** (majority vote) upon the vehicle's exit, writing only the highest-confidence string to the database.
 
----
-
-## 🛠️ Prerequisites
-
+### Prerequisites
 Before you begin, ensure you have the following installed on your host machine:
 - [Docker](https://docs.docker.com/get-docker/) & [Docker Compose](https://docs.docker.com/compose/install/)
 - Git
-
 *(Note: For production deployments, ensure the server has the `nvidia-container-toolkit` installed to enable GPU acceleration).*
 
----
-
-## 🚀 How to Run and Test the Pipeline
-
+### How to Run and Test the Pipeline
 1. **Clone the Repository**
    ```bash
-   git clone <repository-url>
-   cd Traffic_Analysis_Workflow
+   git clone https://github.com/VeerabhadraYerram/Traffic_CV.git
+   cd Traffic_CV
    ```
-
 2. **Launch the Infrastructure**
    Run the following command to build the images, spin up the Postgres database, execute the initial `schema.sql` migration, and start the processing pipeline:
    ```bash
    docker compose up -d --build
    ```
    *(Note: The first build will take a few minutes as it downloads PyTorch, YOLO11, OpenCV, and DeepSORT dependencies).*
-
 3. **How to Test with Local Video Files**
    In the `docker-compose.yml`, your local `Downloads` folder is mounted to `/app/downloads/` inside the container. 
    
@@ -60,20 +73,16 @@ Before you begin, ensure you have the following installed on your host machine:
      ```bash
      docker restart traffic_pipeline
      ```
-
 4. **Monitor Live Logs**
    To watch the computer vision models track vehicles and resolve plates in real-time, view the Docker logs:
    ```bash
    docker logs -f traffic_pipeline
    ```
 
----
-
-## 📹 Adding & Configuring Live Cameras
-
+### Adding & Configuring Live Cameras
 The system is fully modular. To process a new live camera feed in production, you simply add a row to the `cameras` table in the PostgreSQL database.
 
-### Using Live RTSP Streams
+#### Using Live RTSP Streams
 For real IP security cameras, simply insert the camera's network link into the database:
 ```sql
 INSERT INTO cameras (name, video_source, camera_role, entry_line_normalized, exit_line_normalized, is_active)
@@ -86,34 +95,50 @@ VALUES (
     true
 );
 ```
-### 📐 Coordinate System & Custom Lines
+
+#### Coordinate System & Custom Lines
 The system uses **Normalized Coordinates** (from `0.0` to `1.0`) instead of hardcoded pixels. This ensures that if a camera is upgraded from 1080p to 4K, the virtual lines stay in the exact same physical location.
 - `x = 0.0` is the left edge, `x = 1.0` is the right edge.
 - `y = 0.0` is the top edge, `y = 1.0` is the bottom edge.
 
-#### Quick Testing Template
-If you are just adding a test video and don't want to calculate exact pixels, you can safely paste this generic template into the database row. It draws horizontal lines at the top-third and bottom-third of the screen, which works perfectly for most downward-facing cameras:
-- **entry_line_normalized**: `{"x1": 0.0, "y1": 0.3, "x2": 1.0, "y2": 0.3}`
-- **exit_line_normalized**: `{"x1": 0.0, "y1": 0.7, "x2": 1.0, "y2": 0.7}`
+---
+
+## 📊 Part 2: Web Analytics Dashboard
+
+The Web Analytics Dashboard provides an interactive control panel for smart city operators and traffic law enforcement.
+
+### Tech Stack
+- **Framework:** React 19, TypeScript 6, Vite 8
+- **Routing:** React Router v7
+- **State:** TanStack Query v5, TanStack Table v8
+- **Styling:** Tailwind CSS v4, shadcn/ui (Radix UI)
+- **Charts:** Recharts v3
+- **Maps:** Google Maps API
+- **Backend Sync:** Appwrite SDK
+- **Notifications:** Sonner
+
+### Getting Started
+1. **Install Dependencies**
+   ```bash
+   npm install
+   ```
+2. **Start the Development Server**
+   ```bash
+   npm run dev
+   ```
+3. **Build for Production**
+   ```bash
+   npm run build
+   ```
+4. **Preview Production Build**
+   ```bash
+   npm run preview
+   ```
 
 ---
 
-## 📊 Viewing the Data
-
-The ultimate product of this pipeline is the `premise_access_logs` table in Postgres. 
-
-### Option 1: Database GUI (Recommended)
-Connect to the database using any SQL client (DBeaver, TablePlus, Postico):
-- **Host**: `localhost`
-- **Port**: `5432`
-- **User**: `admin`
-- **Password**: `adminpassword`
-- **Database**: `traffic`
-
-### Option 2: Terminal Script
-A convenience script is provided to view the data directly in your terminal.
-```bash
-# In your local Python environment
-pip install pandas psycopg2-binary SQLAlchemy
-python query_db.py
-```
+## 📂 Documentation Reference
+- [Product Requirements](dashboard/docs/PRD.md)
+- [UI Design & Wireframes](dashboard/docs/DESIGN.md)
+- [Database Schema](dashboard/docs/DB.md)
+- [Tech Stack Architecture](dashboard/docs/TechStack.md)
