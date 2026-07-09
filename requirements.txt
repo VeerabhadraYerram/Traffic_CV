@@ -3,4 +3,6 @@ opencv-python-headless
 psycopg2-binary
 SQLAlchemy
 python-dotenv
-inference
+ultralytics
+deep-sort-realtime
+easyocr
