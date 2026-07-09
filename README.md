@@ -28,7 +28,17 @@ graph TD
 
 Here is a preview of the interactive web control center:
 
-![VigilantEye Dashboard Interface](dashboard/playwright_verified_light_mode.png)
+### 1. Live Events Feed & Real-time Monitor
+Displays live video metadata, recent crossings, status badges ("Inside"/"Exited"), and camera logs with filtering.
+![Live Events Feed](dashboard/playwright_verified_light_mode.png)
+
+### 2. Geospatial Vehicle Tracking & Search
+Allows searching vehicles by license plate, displaying their traversal history, last-seen camera details, and a mapping component.
+![Vehicle Tracking & Search](dashboard/tracking_page.png)
+
+### 3. Traffic Analytics & Volume Dashboard
+Features vehicle composition stats (Cars, Bikes, Trucks, Buses), volume trends over time, and alert frequency logs.
+![Traffic Analytics](dashboard/analytics_page.png)
 
 ---
 
