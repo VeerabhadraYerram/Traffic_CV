@@ -31,7 +31,7 @@ def run_benchmark(video_path, name):
     
     # Init Models
     model = YOLO("yolo11m.pt")
-    tracker = DeepSort(max_age=150, n_init=2, nms_max_overlap=1.0)
+    tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
     reader = easyocr.Reader(['en'], gpu=device_is_gpu, verbose=False)
     
     cap = cv2.VideoCapture(container_video_path)
@@ -56,8 +56,7 @@ def run_benchmark(video_path, name):
         
         loop_start = time.time()
 
-        # 1. YOLO Detection
-        results = model(frame, classes=[1, 2, 3, 5, 7], verbose=False)
+        results = model(frame, classes=[1, 2, 3, 5, 7], conf=0.45, verbose=False)
         
         bbs = []
         for r in results:
@@ -88,24 +87,24 @@ def run_benchmark(video_path, name):
             if len(active_sessions[tid]["plate_reads"]) < 10:
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
-                    ocr_results = reader.readtext(crop)
-                    for _, text, prob in ocr_results:
-                        if prob > 0.3:
-                            import re
-                            cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                            if 5 <= len(cleaned) <= 8:
-                                active_sessions[tid]["plate_reads"].append(cleaned)
+                    # Smart Crop: Focus on the bottom 60% of the car to find the plate
+                    ch, cw = crop.shape[:2]
+                    plate_crop = crop[int(ch * 0.4):, :]
+                    
+                    if plate_crop.size > 0:
+                        ocr_results = reader.readtext(plate_crop)
+                        for _, text, prob in ocr_results:
+                            if prob > 0.3:
+                                import re
+                                cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                                if 5 <= len(cleaned) <= 8:
+                                    active_sessions[tid]["plate_reads"].append(cleaned)
                                 
         loop_end = time.time()
         total_processing_time += (loop_end - loop_start)
 
         if frame_counter % 50 == 0:
             print(f"[{name}] Processed {frame_counter}/{total_frames} frames. Current FPS: {frame_counter / total_processing_time:.2f}")
-
-        # Limit to 150 frames for the local Mac benchmark to avoid taking hours
-        if frame_counter >= 150:
-            print(f"[{name}] Reached 150 frames limit for local benchmark.")
-            break
 
     cap.release()
     end_time = time.time()
@@ -126,4 +125,3 @@ def run_benchmark(video_path, name):
 
 if __name__ == "__main__":
     run_benchmark("/app/downloads/test_video.mp4", "Test Video 1 (Short)")
-    run_benchmark("/app/downloads/test_video2.mp4", "Test Video 2 (Long)")
