@@ -1,4 +1,5 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
 import re
 import cv2
 import threading
@@ -24,19 +25,7 @@ import torch
 active_sessions = {}
 session_lock = threading.Lock()
 
-# Dynamically determine the best compute device for EasyOCR
-device_is_gpu = False
-if torch.cuda.is_available():
-    print("NVIDIA CUDA GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-elif torch.backends.mps.is_available():
-    print("Apple Silicon MPS GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-else:
-    print("No compatible GPU detected. Falling back to CPU for EasyOCR.")
-
-print("Initializing EasyOCR Model (this might take a few seconds on first run)...")
-reader = easyocr.Reader(['en'], gpu=device_is_gpu)
+# Device resolution moved inside process_camera to prevent deadlocks
 
 def get_mode(items):
     if not items:
@@ -52,11 +41,27 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
     # Initialize DeepSORT Tracker (Tuned)
     tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
     
+    device_is_gpu = False
+    if torch.cuda.is_available():
+        device_is_gpu = True
+    elif torch.backends.mps.is_available():
+        device_is_gpu = True
+    
+    print(f"[{name}] Initializing EasyOCR Model on {'GPU' if device_is_gpu else 'CPU'}...")
+    reader = easyocr.Reader(['en'], gpu=device_is_gpu, verbose=False)
+    
     # Init DB memory for this camera
     with session_lock:
         if cam_id not in active_sessions:
             active_sessions[cam_id] = {}
             
+    import os
+    # Strip any accidental single or double quotes from the DB string
+    video_source = video_source.strip("'\"")
+    
+    print(f"[{name}] Attempting to open video source: '{video_source}'")
+    print(f"[{name}] File exists according to OS: {os.path.exists(video_source)}")
+    
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"[{name}] ⚠️ Cannot open video source. Exiting thread.")
@@ -166,7 +171,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                             for bbox, text, prob in ocr_results:
                                 if prob > 0.3:
                                     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                                    if 5 <= len(cleaned) <= 8:
+                                    if 4 <= len(cleaned) <= 12:
                                         active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
                                     
             # Cleanup old trackers
