@@ -16,6 +16,8 @@ The system is designed for 100% on-premise, air-gapped deployment capability (no
 - **Zero Cloud Dependency**: Completely local execution. No API keys, no credit limits, no internet requirement.
 - **Dynamic Hardware Acceleration**: Automatically detects and leverages NVIDIA CUDA GPUs, Apple Silicon MPS, or standard CPUs depending on the deployment server.
 - **Database-Driven Configuration**: Camera video sources, roles, and crossing lines are fetched dynamically from Postgres. No need to touch Python code to add a new gate.
+- **Smart-Cropped OCR Pipeline**: To eliminate background noise and maximize FPS, the system intelligently crops out the bottom 60% of tracked vehicle bounding boxes before feeding images into the EasyOCR engine, drastically improving license plate read accuracy and effectively doubling processing speed.
+- **Aggressive DeepSORT Tracking**: Tracking parameters (`max_age=30`, `nms_max_overlap=0.5`) are heavily tuned for dense, low-speed traffic, eliminating duplicate bounding boxes and preventing "ghosting" tracks after cars leave the frame.
 - **Temporal ALPR Consensus**: Instead of saving messy, single-frame OCR reads, the pipeline accumulates all plate readings for a given tracking ID and calculates the statistical **mode** (majority vote) upon the vehicle's exit, writing only the highest-confidence string to the database.
 
 ---
@@ -62,9 +64,14 @@ Before you begin, ensure you have the following installed on your host machine:
      ```
 
 4. **Monitor Live Logs**
-   To watch the computer vision models track vehicles and resolve plates in real-time, view the Docker logs:
    ```bash
    docker logs -f traffic_pipeline
+   ```
+
+5. **Generate a Debug/Visualization Video**
+   If you need to verify tracking accuracy or see exactly where your crossing lines are physically drawn, you can run the debugging visualization script. This will output a file named `output_video.mp4` to your `Downloads` folder showing YOLO bounding boxes, tracker IDs, OCR reads, and the entry/exit lines.
+   ```bash
+   docker compose run --rm app python visualize.py
    ```
 
 ---
