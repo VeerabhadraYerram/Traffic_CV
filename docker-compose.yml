@@ -23,7 +23,7 @@ services:
       # Map the local codebase for instant code reloads
       - ./:/app
       # Map the local downloads folder so the test video is accessible inside Docker
-      - /Users/shivaniyerram/Downloads:/app/downloads
+      - ./downloads:/app/downloads
     depends_on:
       - db
 

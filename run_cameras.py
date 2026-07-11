@@ -25,34 +25,67 @@ import torch
 active_sessions = {}
 session_lock = threading.Lock()
 
-# Dynamically determine the best compute device for EasyOCR
-device_is_gpu = False
-if torch.cuda.is_available():
-    print("NVIDIA CUDA GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-elif torch.backends.mps.is_available():
-    print("Apple Silicon MPS GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-else:
-    print("No compatible GPU detected. Falling back to CPU for EasyOCR.")
+def check_cuda_working():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, minor = torch.cuda.get_device_capability(0)
+        if major >= 10:
+            print(f"ℹ️ Detected Blackwell GPU with compute capability {major}.{minor}. Standard PyTorch stable wheels do not support sm_{major}{minor} yet. Falling back to CPU for stability.")
+            return False
+        x = torch.rand(1, 1).cuda()
+        _ = x @ x
+        return True
+    except Exception:
+        print("⚠️ CUDA is available, but compute kernels are not compatible with your GPU. Falling back to CPU.")
+        return False
+
+# Dynamically determine the best compute device for EasyOCR and YOLO
+device_is_gpu = check_cuda_working() or torch.backends.mps.is_available()
+print(f"Device: {'GPU' if device_is_gpu else 'CPU'}")
 
 # Initialize EasyOCR Reader globally (it loads models into memory once)
 print("Initializing EasyOCR Model (this might take a few seconds on first run)...")
 reader = easyocr.Reader(['en'], gpu=device_is_gpu)
+
+# Initialize YOLO License Plate Detection model globally
+lp_model_path = os.path.join(os.path.dirname(__file__), "models", "yolov8n_license_plate.pt")
+if os.path.exists(lp_model_path):
+    print("Loading local YOLO License Plate detection model...")
+    lp_detector = YOLO(lp_model_path).to('cuda' if device_is_gpu else 'cpu')
+else:
+    print("WARNING: Local YOLO License Plate detection model not found. Fallback to bottom 60% crop.")
+    lp_detector = None
 
 def get_mode(items):
     if not items:
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
 
+def preprocess_plate(crop_plate):
+    if crop_plate is None or crop_plate.size == 0:
+        return crop_plate
+    try:
+        # Convert to grayscale
+        gray = cv2.cvtColor(crop_plate, cv2.COLOR_BGR2GRAY)
+        # Upscale 3x using cubic interpolation
+        resized = cv2.resize(gray, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        # Apply CLAHE contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(resized)
+        return enhanced
+    except Exception as e:
+        print(f"Error preprocessing plate image: {e}")
+        return crop_plate
+
 def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
     
     # Initialize YOLO11 Model
-    model = YOLO("yolo11m.pt") # This will download automatically on first run
+    model = YOLO("yolo11m.pt").to('cuda' if device_is_gpu else 'cpu') # This will download automatically on first run
     
     # Initialize DeepSORT Tracker
-    tracker = DeepSort(max_age=150, n_init=2, nms_max_overlap=1.0)
+    tracker = DeepSort(max_age=150, n_init=2, nms_max_overlap=1.0, embedder_gpu=device_is_gpu)
     
     # Init DB memory for this camera
     with session_lock:
@@ -96,7 +129,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         # 1. Detection (YOLOv8)
         # COCO Classes: 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck
         # Note: Auto-rickshaws (3-wheelers) are usually detected as either cars (2) or motorcycles (3) by default YOLOv8.
-        results = model(frame, classes=[1, 2, 3, 5, 7], verbose=False)
+        results = model(frame, classes=[1, 2, 3, 5, 7], verbose=False, device='cuda' if device_is_gpu else 'cpu')
         
         # Format for DeepSORT: [([left,top,w,h], confidence, detection_class), ...]
         bbs = []
@@ -157,15 +190,31 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 # We only want to OCR if we haven't got enough confident reads yet to save CPU
                 # 10 confident reads is plenty for a consensus
                 if len(active_sessions[cam_id][tid]["plate_reads"]) < 10:
-                    # Crop image
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        ocr_results = reader.readtext(crop)
-                        for bbox, text, prob in ocr_results:
-                            if prob > 0.3:
-                                cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                                if 5 <= len(cleaned) <= 8:
-                                    active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
+                    crop_vehicle = frame[y1:y2, x1:x2]
+                    if crop_vehicle.size > 0:
+                        crop_plate = None
+                        
+                        # Stage 1: Try YOLO License Plate Detector
+                        if lp_detector is not None:
+                            lp_results = lp_detector(crop_vehicle, verbose=False, device='cuda' if device_is_gpu else 'cpu')
+                            for lp_box in lp_results[0].boxes:
+                                lpx1, lpy1, lpx2, lpy2 = lp_box.xyxy[0].tolist()
+                                crop_plate = crop_vehicle[int(lpy1):int(lpy2), int(lpx1):int(lpx2)]
+                                break
+                                
+                        # Stage 2: Fallback to bottom 60% of vehicle crop if YOLO fails or is not loaded
+                        if crop_plate is None or crop_plate.size == 0:
+                            vh = y2 - y1
+                            crop_plate = frame[int(y1 + 0.4 * vh):y2, x1:x2]
+                            
+                        if crop_plate is not None and crop_plate.size > 0:
+                            processed_plate = preprocess_plate(crop_plate)
+                            ocr_results = reader.readtext(processed_plate)
+                            for bbox, text, prob in ocr_results:
+                                if prob > 0.3:
+                                    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                                    if 5 <= len(cleaned) <= 8:
+                                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
                                     
             # Cleanup old trackers
             stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
