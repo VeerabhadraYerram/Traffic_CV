@@ -79,7 +79,15 @@ Before you begin, ensure you have the following installed on your host machine:
    docker logs -f traffic_pipeline
    ```
 
-
+7. **Generate a Debug/Visualization Video (Optional)**
+   If you need to verify tracking accuracy or see exactly where your crossing lines are physically drawn, you can run the debugging visualization script. This will output a file named `your_video_output.mp4` to your `data/downloads/` folder showing YOLO bounding boxes, tracker IDs, OCR reads, and the entry/exit lines.
+   ```bash
+   # Automatically visualize the first active camera in your database
+   docker compose run --rm app python visualize.py
+   
+   # Or explicitly specify which camera to visualize
+   docker compose run --rm app python visualize.py --camera "Test Video Bidirectional"
+   ```
 
 ---
 
