@@ -48,6 +48,8 @@ Features vehicle composition stats (Cars, Bikes, Trucks, Buses), volume trends o
 - **Zero Cloud Dependency**: Completely local execution. No API keys, no credit limits, no internet requirement.
 - **Dynamic Hardware Acceleration**: Automatically detects and leverages NVIDIA CUDA GPUs, Apple Silicon MPS, or standard CPUs depending on the deployment server.
 - **Database-Driven Configuration**: Camera video sources, roles, and crossing lines are fetched dynamically from Postgres. No need to touch Python code to add a new gate.
+- **Smart-Cropped OCR Pipeline**: To eliminate background noise and maximize FPS, the system intelligently crops out the bottom 60% of tracked vehicle bounding boxes before feeding images into the EasyOCR engine, drastically improving license plate read accuracy and effectively doubling processing speed.
+- **Aggressive DeepSORT Tracking**: Tracking parameters (`max_age=30`, `nms_max_overlap=0.5`) are heavily tuned for dense, low-speed traffic, eliminating duplicate bounding boxes and preventing "ghosting" tracks after cars leave the frame.
 - **Temporal ALPR Consensus**: Instead of saving messy, single-frame OCR reads, the pipeline accumulates all plate readings for a given tracking ID and calculates the statistical **mode** (majority vote) upon the vehicle's exit, writing only the highest-confidence string to the database.
 
 ### Prerequisites
@@ -69,10 +71,11 @@ Before you begin, ensure you have the following installed on your host machine:
    ```
    *(Note: The first build will take a few minutes as it downloads PyTorch, YOLO11, OpenCV, and DeepSORT dependencies).*
 3. **How to Test with Local Video Files**
-   In the `docker-compose.yml`, your local `Downloads` folder is mounted to `/app/downloads/` inside the container. 
+   In the `docker-compose.yml`, the `data/downloads` folder inside this repository is mounted to `/app/downloads/` inside the container. 
    
    To test the pipeline on a video file:
-   - Drop a test video (e.g., `test_video.mp4`) into your computer's `Downloads` folder.
+   - Create a folder named `data/downloads` inside this project directory.
+   - Drop a test video (e.g., `test_video.mp4`) into `data/downloads/`.
    - Connect to the local Postgres database (`localhost:5432`, user: `admin`, pass: `adminpassword`).
    - Insert a row into the `cameras` table pointing to your video:
      ```sql
@@ -83,13 +86,26 @@ Before you begin, ensure you have the following installed on your host machine:
      ```bash
      docker restart traffic_pipeline
      ```
-4. **Monitor Live Logs**
-   To watch the computer vision models track vehicles and resolve plates in real-time, view the Docker logs:
+
+4. **NVIDIA GPU Acceleration (Optional)**
+   If your server has an NVIDIA GPU, you can unlock 60+ FPS processing. Open `docker-compose.yml`, locate the `deploy` block under the `app` service, and uncomment it to enable native Docker GPU passthrough.
+
+5. **Web Configuration Dashboard**
+   A sleek web interface is automatically started alongside the pipeline. You can use it to visually draw entry and exit tripwires for any camera.
+   - Open your browser to: `http://localhost:8000`
+   - Select a camera from the dropdown to load a snapshot frame.
+   - Use the drawing tools to place your green and red lines.
+   - Click "Save Configuration" to instantly update the PostgreSQL database.
+
+6. **Monitor Live Logs**
    ```bash
    docker logs -f traffic_pipeline
    ```
 
-### Adding & Configuring Live Cameras
+---
+
+## 📹 Adding & Configuring Live Cameras
+
 The system is fully modular. To process a new live camera feed in production, you simply add a row to the `cameras` table in the PostgreSQL database.
 
 #### Using Live RTSP Streams

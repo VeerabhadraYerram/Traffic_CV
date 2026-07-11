@@ -1,4 +1,5 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
 import re
 import cv2
 import threading
@@ -15,7 +16,6 @@ from models import Camera, PremiseAccessLog, CameraRole
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import easyocr
-
 load_dotenv()
 
 import torch
@@ -25,20 +25,7 @@ import torch
 active_sessions = {}
 session_lock = threading.Lock()
 
-# Dynamically determine the best compute device for EasyOCR
-device_is_gpu = False
-if torch.cuda.is_available():
-    print("NVIDIA CUDA GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-elif torch.backends.mps.is_available():
-    print("Apple Silicon MPS GPU Detected! Enabling for EasyOCR.")
-    device_is_gpu = True
-else:
-    print("No compatible GPU detected. Falling back to CPU for EasyOCR.")
-
-# Initialize EasyOCR Reader globally (it loads models into memory once)
-print("Initializing EasyOCR Model (this might take a few seconds on first run)...")
-reader = easyocr.Reader(['en'], gpu=device_is_gpu)
+# Device resolution moved inside process_camera to prevent deadlocks
 
 def get_mode(items):
     if not items:
@@ -51,14 +38,30 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
     # Initialize YOLO11 Model
     model = YOLO("yolo11m.pt") # This will download automatically on first run
     
-    # Initialize DeepSORT Tracker
-    tracker = DeepSort(max_age=150, n_init=2, nms_max_overlap=1.0)
+    # Initialize DeepSORT Tracker (Tuned)
+    tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
+    
+    device_is_gpu = False
+    if torch.cuda.is_available():
+        device_is_gpu = True
+    elif torch.backends.mps.is_available():
+        device_is_gpu = True
+    
+    print(f"[{name}] Initializing EasyOCR Model on {'GPU' if device_is_gpu else 'CPU'}...")
+    reader = easyocr.Reader(['en'], gpu=device_is_gpu, verbose=False)
     
     # Init DB memory for this camera
     with session_lock:
         if cam_id not in active_sessions:
             active_sessions[cam_id] = {}
             
+    import os
+    # Strip any accidental single or double quotes from the DB string
+    video_source = video_source.strip("'\"")
+    
+    print(f"[{name}] Attempting to open video source: '{video_source}'")
+    print(f"[{name}] File exists according to OS: {os.path.exists(video_source)}")
+    
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"[{name}] ⚠️ Cannot open video source. Exiting thread.")
@@ -96,7 +99,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         # 1. Detection (YOLOv8)
         # COCO Classes: 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck
         # Note: Auto-rickshaws (3-wheelers) are usually detected as either cars (2) or motorcycles (3) by default YOLOv8.
-        results = model(frame, classes=[1, 2, 3, 5, 7], verbose=False)
+        results = model(frame, classes=[1, 2, 3, 5, 7], conf=0.45, verbose=False)
         
         # Format for DeepSORT: [([left,top,w,h], confidence, detection_class), ...]
         bbs = []
@@ -157,15 +160,19 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 # We only want to OCR if we haven't got enough confident reads yet to save CPU
                 # 10 confident reads is plenty for a consensus
                 if len(active_sessions[cam_id][tid]["plate_reads"]) < 10:
-                    # Crop image
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
-                        ocr_results = reader.readtext(crop)
-                        for bbox, text, prob in ocr_results:
-                            if prob > 0.3:
-                                cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                                if 5 <= len(cleaned) <= 8:
-                                    active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
+                        # Smart Crop: Focus on the bottom 60% of the car to find the plate
+                        ch, cw = crop.shape[:2]
+                        plate_crop = crop[int(ch * 0.4):, :]
+                        
+                        if plate_crop.size > 0:
+                            ocr_results = reader.readtext(plate_crop)
+                            for bbox, text, prob in ocr_results:
+                                if prob > 0.3:
+                                    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                                    if 4 <= len(cleaned) <= 12:
+                                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
                                     
             # Cleanup old trackers
             stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
