@@ -6,3 +6,5 @@ python-dotenv
 ultralytics
 deep-sort-realtime
 easyocr
+fastapi
+uvicorn

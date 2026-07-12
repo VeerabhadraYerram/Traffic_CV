@@ -71,10 +71,11 @@ Before you begin, ensure you have the following installed on your host machine:
    ```
    *(Note: The first build will take a few minutes as it downloads PyTorch, YOLO11, OpenCV, and DeepSORT dependencies).*
 3. **How to Test with Local Video Files**
-   In the `docker-compose.yml`, your local `Downloads` folder is mounted to `/app/downloads/` inside the container. 
+   In the `docker-compose.yml`, the `data/downloads` folder inside this repository is mounted to `/app/downloads/` inside the container. 
    
    To test the pipeline on a video file:
-   - Drop a test video (e.g., `test_video.mp4`) into your computer's `Downloads` folder.
+   - Create a folder named `data/downloads` inside this project directory.
+   - Drop a test video (e.g., `test_video.mp4`) into `data/downloads/`.
    - Connect to the local Postgres database (`localhost:5432`, user: `admin`, pass: `adminpassword`).
    - Insert a row into the `cameras` table pointing to your video:
      ```sql
@@ -85,12 +86,23 @@ Before you begin, ensure you have the following installed on your host machine:
      ```bash
      docker restart traffic_pipeline
      ```
-4. **Monitor Live Logs**
+
+4. **NVIDIA GPU Acceleration (Optional)**
+   If your server has an NVIDIA GPU, you can unlock 60+ FPS processing. Open `docker-compose.yml`, locate the `deploy` block under the `app` service, and uncomment it to enable native Docker GPU passthrough.
+
+5. **Web Configuration Dashboard**
+   A sleek web interface is automatically started alongside the pipeline. You can use it to visually draw entry and exit tripwires for any camera.
+   - Open your browser to: `http://localhost:8000`
+   - Select a camera from the dropdown to load a snapshot frame.
+   - Use the drawing tools to place your green and red lines.
+   - Click "Save Configuration" to instantly update the PostgreSQL database.
+
+6. **Monitor Live Logs**
    ```bash
    docker logs -f traffic_pipeline
    ```
 
-5. **Generate a Debug/Visualization Video**
+7. **Generate a Debug/Visualization Video**
    If you need to verify tracking accuracy or see exactly where your crossing lines are physically drawn, you can run the debugging visualization script. This will output a file named `output_video.mp4` to your `Downloads` folder showing YOLO bounding boxes, tracker IDs, OCR reads, and the entry/exit lines.
    ```bash
    docker compose run --rm app python visualize.py

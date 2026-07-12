@@ -18,14 +18,44 @@ services:
     container_name: traffic_pipeline
     environment:
       - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
+      - PYTHONUNBUFFERED=1
 
     volumes:
       # Map the local codebase for instant code reloads
       - ./:/app
-      # Map the local downloads folder so the test video is accessible inside Docker
-      - /Users/shivaniyerram/Downloads:/app/downloads
+      # Universal video data mapping
+      - ./data/downloads:/app/downloads
+      # Persist EasyOCR models so it doesn't crash on DNS timeouts
+      - easyocr_models:/root/.EasyOCR/model
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      - db
+
+    # Uncomment this block below to run on NVIDIA GPUs natively (60+ FPS):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  web:
+    build: .
+    container_name: traffic_web
+    command: uvicorn web_ui:app --host 0.0.0.0 --port 8000
+    environment:
+      - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+      - ./data/downloads:/app/downloads
     depends_on:
       - db
 
 volumes:
   postgres_data:
+  easyocr_models:

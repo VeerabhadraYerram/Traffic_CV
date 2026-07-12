@@ -67,7 +67,7 @@ def main():
     max_frames = total_frames // 2
     print(f"Video Dimensions: {width}x{height} | Target Frames: {max_frames} (50% of {total_frames})")
     
-    # Setup Video Writer
+    # Setup Video Writer (using mp4v as hardware avc1 fails in Docker)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
@@ -154,7 +154,7 @@ def main():
                         for _, text, prob in ocr_results:
                             if prob > 0.3:
                                 cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                                if 5 <= len(cleaned) <= 8:
+                                if 4 <= len(cleaned) <= 12:
                                     active_sessions[tid]["plate_reads"].append(cleaned)
             
             current_plate = get_mode(active_sessions[tid]["plate_reads"])
