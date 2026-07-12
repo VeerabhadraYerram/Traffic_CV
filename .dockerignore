@@ -1,0 +1,14 @@
+dashboard/node_modules
+node_modules
+__pycache__
+.git
+.agents
+.gemini
+dashboard/dist
+dashboard/build
+data/downloads
+downloads/*.mp4
+downloads/*.exe
+*.pt
+*.gguf
+models/*.gguf
