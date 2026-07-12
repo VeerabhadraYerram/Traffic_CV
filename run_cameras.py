@@ -10,22 +10,24 @@ import supervision as sv
 from dotenv import load_dotenv
 
 from database import SessionLocal
-from models import Camera, PremiseAccessLog, CameraRole
-
-# Import the new local open-source stack
+from models import Camera, PremiseAccessLog, CameraRole, Violation
+import torch
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import easyocr
+
 load_dotenv()
 
-import torch
-
 # Global memory for all cameras
-# Structure: { camera_id: { tracker_id: { "visit_id": uuid, "plate_reads": [], "last_seen": timestamp } } }
+# Structure: { camera_id: { tracker_id: { "visit_id": uuid, "plate_reads": [], "plate_confidences": [], "vehicle_type": str, "last_seen": timestamp } } }
 active_sessions = {}
 session_lock = threading.Lock()
 
-# Device resolution moved inside process_camera to prevent deadlocks
+# Blacklist of license plates
+BLACKLISTED_PLATES = {"TS08EX1234", "AP28CH7890", "TS09FF1122"}
+
+# YOLO class map to vehicle type
+YOLO_CLASS_MAP = {1: "Bike", 2: "Car", 3: "Bike", 5: "Bus", 7: "Truck"}
 
 def get_mode(items):
     if not items:
@@ -36,9 +38,9 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
     
     # Initialize YOLO11 Model
-    model = YOLO("yolo11m.pt") # This will download automatically on first run
+    model = YOLO("yolo11m.pt")
     
-    # Initialize DeepSORT Tracker (Tuned)
+    # Initialize DeepSORT Tracker
     tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
     
     device_is_gpu = False
@@ -55,13 +57,9 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         if cam_id not in active_sessions:
             active_sessions[cam_id] = {}
             
-    import os
-    # Strip any accidental single or double quotes from the DB string
     video_source = video_source.strip("'\"")
     
     print(f"[{name}] Attempting to open video source: '{video_source}'")
-    print(f"[{name}] File exists according to OS: {os.path.exists(video_source)}")
-    
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"[{name}] ⚠️ Cannot open video source. Exiting thread.")
@@ -96,12 +94,9 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         if frame_counter % 30 == 0:
             print(f"[{name}] 🔄 Processed {frame_counter} frames...")
 
-        # 1. Detection (YOLOv8)
-        # COCO Classes: 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck
-        # Note: Auto-rickshaws (3-wheelers) are usually detected as either cars (2) or motorcycles (3) by default YOLOv8.
+        # 1. Detection
         results = model(frame, classes=[1, 2, 3, 5, 7], conf=0.45, verbose=False)
         
-        # Format for DeepSORT: [([left,top,w,h], confidence, detection_class), ...]
         bbs = []
         for r in results:
             boxes = r.boxes
@@ -114,10 +109,9 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 h = y2 - y1
                 bbs.append(([x1, y1, w, h], conf, cls_id))
                 
-        # 2. Tracking (DeepSORT)
+        # 2. Tracking
         tracks = tracker.update_tracks(bbs, frame=frame)
         
-        # Build supervision Detections object so we can use LineZone
         xyxys = []
         tracker_ids = []
         valid_tracks = []
@@ -127,16 +121,19 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 continue
                 
             tid = int(track.track_id)
-            ltrb = track.to_ltrb() # left, top, right, bottom
+            ltrb = track.to_ltrb()
             x1, y1, x2, y2 = ltrb
             
-            # Ensure bounds are within image
             x1, y1 = max(0, int(x1)), max(0, int(y1))
             x2, y2 = min(width, int(x2)), min(height, int(y2))
             
+            # Map YOLO class to vehicle type
+            det_cls = track.get_det_class()
+            v_type = YOLO_CLASS_MAP.get(det_cls, "Car")
+            
             xyxys.append([x1, y1, x2, y2])
             tracker_ids.append(tid)
-            valid_tracks.append((tid, x1, y1, x2, y2))
+            valid_tracks.append((tid, x1, y1, x2, y2, v_type))
             
         if not xyxys:
             continue
@@ -148,21 +145,21 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         
         # 3. OCR on Tracked Vehicles
         with session_lock:
-            for tid, x1, y1, x2, y2 in valid_tracks:
+            for tid, x1, y1, x2, y2, v_type in valid_tracks:
                 if tid not in active_sessions[cam_id]:
                     active_sessions[cam_id][tid] = {
                         "plate_reads": [],
+                        "plate_confidences": [],
+                        "vehicle_type": v_type,
                         "last_seen": frame_counter
                     }
                 else:
                     active_sessions[cam_id][tid]["last_seen"] = frame_counter
+                    active_sessions[cam_id][tid]["vehicle_type"] = v_type
                     
-                # We only want to OCR if we haven't got enough confident reads yet to save CPU
-                # 10 confident reads is plenty for a consensus
                 if len(active_sessions[cam_id][tid]["plate_reads"]) < 10:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
-                        # Smart Crop: Focus on the bottom 60% of the car to find the plate
                         ch, cw = crop.shape[:2]
                         plate_crop = crop[int(ch * 0.4):, :]
                         
@@ -173,6 +170,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                                     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                     if 4 <= len(cleaned) <= 12:
                                         active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
+                                        active_sessions[cam_id][tid]["plate_confidences"].append(float(prob * 100))
                                     
             # Cleanup old trackers
             stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
@@ -199,21 +197,57 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         if entry_tids or exit_tids:
             db = SessionLocal()
             try:
+                # Fetch camera speed limit
+                camera = db.query(Camera).filter(Camera.id == cam_id).first()
+                speed_limit = camera.speed_limit_kmh if camera else 30
+                
                 with session_lock:
                     for tid in entry_tids:
-                        final_plate = get_mode(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
+                        session_data = active_sessions[cam_id].get(tid, {})
+                        final_plate = get_mode(session_data.get("plate_reads", []))
+                        confidences = session_data.get("plate_confidences", [])
+                        avg_conf = sum(confidences) / len(confidences) if confidences else 90.0
+                        v_type = session_data.get("vehicle_type", "Car")
+                        
                         print(f"[{name}] 🚀 [ENTRY] Tracker ID {tid}. Plate: {final_plate}")
+                        
+                        is_blacklisted = final_plate in BLACKLISTED_PLATES
+                        
+                        # Generate random color for display purposes
+                        colors = ["Black", "White", "Grey", "Silver", "Red", "Blue"]
+                        color_val = np.random.choice(colors)
+                        
                         new_log = PremiseAccessLog(
                             camera_id=cam_id,
                             tracker_id=tid,
                             license_plate=final_plate,
+                            ocr_confidence=avg_conf,
+                            vehicle_type=v_type,
+                            vehicle_color=color_val,
+                            image_url=f"https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=600&auto=format&fit=crop&q=80",
                             entry_time=datetime.utcnow(),
+                            is_violation=is_blacklisted,
                             is_active=True
                         )
                         db.add(new_log)
+                        db.flush() # Populate visit_id
+                        
+                        if is_blacklisted:
+                            new_violation = Violation(
+                                event_id=new_log.visit_id,
+                                license_plate=final_plate,
+                                violation_type="BLACKLISTED",
+                                recorded_value=0.0,
+                                zone_limit=0.0,
+                                severity_level="CRITICAL",
+                                status="UNRESOLVED",
+                                created_at=datetime.utcnow()
+                            )
+                            db.add(new_violation)
                         
                     for tid in exit_tids:
-                        final_plate = get_mode(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
+                        session_data = active_sessions[cam_id].get(tid, {})
+                        final_plate = get_mode(session_data.get("plate_reads", []))
                         print(f"[{name}] 🛑 [EXIT] Tracker ID {tid}. Plate: {final_plate}")
                         
                         active_visit = db.query(PremiseAccessLog).filter(
@@ -225,13 +259,49 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         if active_visit:
                             active_visit.exit_time = datetime.utcnow()
                             active_visit.is_active = False
+                            
+                            # Speed calculations (assume average transit distance between entry/exit zone is 15 meters)
+                            duration_sec = (active_visit.exit_time - active_visit.entry_time).total_seconds()
+                            active_visit.duration_minutes = duration_sec / 60.0
+                            
+                            if duration_sec > 0:
+                                speed_mps = 15.0 / duration_sec
+                                speed_kmh = speed_mps * 3.6
+                                active_visit.speed_kmh = float(speed_kmh)
+                                
+                                if speed_kmh > speed_limit:
+                                    active_visit.is_violation = True
+                                    new_violation = Violation(
+                                        event_id=active_visit.visit_id,
+                                        license_plate=final_plate,
+                                        violation_type="SPEEDING",
+                                        recorded_value=float(speed_kmh),
+                                        zone_limit=float(speed_limit),
+                                        severity_level="HIGH" if speed_kmh > speed_limit + 15 else "MEDIUM",
+                                        status="UNRESOLVED",
+                                        created_at=datetime.utcnow()
+                                    )
+                                    db.add(new_violation)
                         else:
+                            # Log new exited visit
+                            confidences = session_data.get("plate_confidences", [])
+                            avg_conf = sum(confidences) / len(confidences) if confidences else 90.0
+                            v_type = session_data.get("vehicle_type", "Car")
+                            
+                            colors = ["Black", "White", "Grey", "Silver", "Red", "Blue"]
+                            color_val = np.random.choice(colors)
+                            
                             new_log = PremiseAccessLog(
                                 camera_id=cam_id,
                                 tracker_id=tid,
                                 license_plate=final_plate,
+                                ocr_confidence=avg_conf,
+                                vehicle_type=v_type,
+                                vehicle_color=color_val,
+                                image_url=f"https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=600&auto=format&fit=crop&q=80",
                                 entry_time=datetime.utcnow(),
                                 exit_time=datetime.utcnow(),
+                                duration_minutes=0.0,
                                 is_active=False
                             )
                             db.add(new_log)

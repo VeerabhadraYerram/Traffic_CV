@@ -11,7 +11,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./schema.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "5432:5432"
+      - "5435:5432"
 
   app:
     build: .
@@ -24,7 +24,7 @@ services:
       # Map the local codebase for instant code reloads
       - ./:/app
       # Universal video data mapping
-      - ./data/downloads:/app/downloads
+      - ./downloads:/app/downloads
       # Persist EasyOCR models so it doesn't crash on DNS timeouts
       - easyocr_models:/root/.EasyOCR/model
     dns:
@@ -52,7 +52,7 @@ services:
       - "8000:8000"
     volumes:
       - ./:/app
-      - ./data/downloads:/app/downloads
+      - ./downloads:/app/downloads
     depends_on:
       - db
 

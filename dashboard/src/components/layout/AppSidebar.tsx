@@ -122,10 +122,10 @@ export function AppSidebar() {
 
       <SidebarFooter className="p-4 border-t border-sidebar-border">
         <div className="flex items-center justify-between text-xs text-slate-500">
-          <div className="flex items-center gap-2 cursor-pointer hover:text-slate-300">
+          <a href="/static/configurator.html" className="flex items-center gap-2 cursor-pointer hover:text-slate-300 text-slate-500 decoration-none">
             <Settings className="h-4 w-4" />
             <span>Config</span>
-          </div>
+          </a>
           <div className="flex items-center gap-1 cursor-pointer hover:text-slate-300">
             <HelpCircle className="h-4 w-4" />
             <span>Help</span>

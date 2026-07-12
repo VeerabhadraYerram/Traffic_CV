@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { dataService, globalStateStore } from '../lib/state-store';
-import { USE_MOCK_DATA } from '../lib/appwrite';
+import { dataService, globalStateStore, USE_MOCK_DATA } from '../lib/state-store';
 
 export function useEvents() {
   const queryClient = useQueryClient();
@@ -17,6 +16,7 @@ export function useEvents() {
 
   return useQuery({
     queryKey: ['events'],
-    queryFn: () => dataService.getEvents()
+    queryFn: () => dataService.getEvents(),
+    refetchInterval: USE_MOCK_DATA ? false : 3000
   });
 }

@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { dataService, globalStateStore } from '../lib/state-store';
-import { USE_MOCK_DATA } from '../lib/appwrite';
+import { dataService, globalStateStore, USE_MOCK_DATA } from '../lib/state-store';
 import type { Violation } from '../types';
 
 export function useViolations() {
@@ -18,7 +17,8 @@ export function useViolations() {
 
   return useQuery({
     queryKey: ['violations'],
-    queryFn: () => dataService.getViolations()
+    queryFn: () => dataService.getViolations(),
+    refetchInterval: USE_MOCK_DATA ? false : 3000
   });
 }
 
