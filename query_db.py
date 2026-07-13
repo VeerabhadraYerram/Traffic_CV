@@ -6,8 +6,8 @@ import pandas as pd
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 
-# Connect to the local database exposed by Docker on port 5432
-DATABASE_URL = "postgresql://admin:adminpassword@localhost:5432/traffic"
+# Connect to the local database exposed by Docker on port 5435
+DATABASE_URL = "postgresql://admin:adminpassword@localhost:5435/traffic"
 engine = create_engine(DATABASE_URL)
 
 def view_database():
