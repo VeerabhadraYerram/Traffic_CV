@@ -32,6 +32,26 @@ def get_mode(items):
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
 
+def get_final_plate(reads):
+    if not reads:
+        return "UNKNOWN"
+    # Sort reads by confidence probability in descending order
+    sorted_reads = sorted(reads, key=lambda x: x[1], reverse=True)
+    # Take the top 10 highest confidence readings
+    top_texts = [text for text, prob in sorted_reads[:10]]
+    return get_mode(top_texts)
+
+def preprocess_plate_crop(crop):
+    if crop is None or crop.size == 0:
+        return crop
+    # 1. Convert to grayscale
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # 2. Resize by 2x to make characters larger and sharper
+    resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    # 3. Apply Bilateral Filter to reduce noise while keeping edges sharp
+    denoised = cv2.bilateralFilter(resized, 9, 75, 75)
+    return denoised
+
 def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
     
@@ -157,9 +177,8 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 else:
                     active_sessions[cam_id][tid]["last_seen"] = frame_counter
                     
-                # We only want to OCR if we haven't got enough confident reads yet to save CPU
-                # 10 confident reads is plenty for a consensus
-                if len(active_sessions[cam_id][tid]["plate_reads"]) < 10:
+                # Collect up to 30 reads along the vehicle's trajectory to capture close-up frames
+                if len(active_sessions[cam_id][tid]["plate_reads"]) < 30:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
                         # Smart Crop: Focus on the bottom 60% of the car to find the plate
@@ -167,12 +186,13 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         plate_crop = crop[int(ch * 0.4):, :]
                         
                         if plate_crop.size > 0:
-                            ocr_results = reader.readtext(plate_crop)
+                            preprocessed_crop = preprocess_plate_crop(plate_crop)
+                            ocr_results = reader.readtext(preprocessed_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
                             for bbox, text, prob in ocr_results:
                                 if prob > 0.3:
                                     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                     if 4 <= len(cleaned) <= 12:
-                                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
+                                        active_sessions[cam_id][tid]["plate_reads"].append((cleaned, prob))
                                     
             # Cleanup old trackers
             stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
@@ -201,7 +221,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
             try:
                 with session_lock:
                     for tid in entry_tids:
-                        final_plate = get_mode(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
+                        final_plate = get_final_plate(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
                         print(f"[{name}] 🚀 [ENTRY] Tracker ID {tid}. Plate: {final_plate}")
                         new_log = PremiseAccessLog(
                             camera_id=cam_id,
@@ -213,7 +233,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         db.add(new_log)
                         
                     for tid in exit_tids:
-                        final_plate = get_mode(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
+                        final_plate = get_final_plate(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
                         print(f"[{name}] 🛑 [EXIT] Tracker ID {tid}. Plate: {final_plate}")
                         
                         active_visit = db.query(PremiseAccessLog).filter(

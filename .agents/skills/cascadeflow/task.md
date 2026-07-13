@@ -1,0 +1,6 @@
+- [x] Implement `preprocess_plate_crop` helper in `run_cameras.py`
+- [x] Update OCR reading loop in `run_cameras.py` with image preprocessing and EasyOCR allowlist
+- [x] Implement `preprocess_plate_crop` helper in `visualize.py`
+- [x] Update OCR reading loop in `visualize.py` with image preprocessing and EasyOCR allowlist
+- [x] Rebuild and restart the Docker stack
+- [x] Verify that the plate detection accuracy has improved

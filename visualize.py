@@ -38,6 +38,26 @@ def get_mode(items):
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
 
+def preprocess_plate_crop(crop):
+    if crop is None or crop.size == 0:
+        return crop
+    # 1. Convert to grayscale
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    # 2. Resize by 2x to make characters larger and sharper
+    resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    # 3. Apply Bilateral Filter to reduce noise while keeping edges sharp
+    denoised = cv2.bilateralFilter(resized, 9, 75, 75)
+    return denoised
+
+def get_final_plate(reads):
+    if not reads:
+        return "UNKNOWN"
+    # Sort reads by confidence probability in descending order
+    sorted_reads = sorted(reads, key=lambda x: x[1], reverse=True)
+    # Take the top 10 highest confidence readings
+    top_texts = [text for text, prob in sorted_reads[:10]]
+    return get_mode(top_texts)
+
 def main():
     print("=====================================")
     print("🎥 Starting Debug Visualization Script")
@@ -169,7 +189,7 @@ def main():
             if tid not in active_sessions:
                 active_sessions[tid] = {"plate_reads": []}
                 
-            if len(active_sessions[tid]["plate_reads"]) < 10:
+            if len(active_sessions[tid]["plate_reads"]) < 30:
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
                     # Smart Crop: Focus on the bottom 60% of the car to find the plate
@@ -177,14 +197,15 @@ def main():
                     plate_crop = crop[int(ch * 0.4):, :]
                     
                     if plate_crop.size > 0:
-                        ocr_results = reader.readtext(plate_crop)
+                        preprocessed_crop = preprocess_plate_crop(plate_crop)
+                        ocr_results = reader.readtext(preprocessed_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
                         for _, text, prob in ocr_results:
                             if prob > 0.3:
                                 cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                 if 4 <= len(cleaned) <= 12:
-                                    active_sessions[tid]["plate_reads"].append(cleaned)
+                                    active_sessions[tid]["plate_reads"].append((cleaned, prob))
             
-            current_plate = get_mode(active_sessions[tid]["plate_reads"])
+            current_plate = get_final_plate(active_sessions[tid]["plate_reads"])
             if current_plate == "UNKNOWN":
                 labels.append(f"#{tid}")
             else:
