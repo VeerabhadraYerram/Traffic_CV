@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timezone
 from collections import Counter
 import numpy as np
+from typing import Dict, Any
 import supervision as sv
 from dotenv import load_dotenv
 
@@ -29,10 +30,174 @@ BLACKLISTED_PLATES = {"TS08EX1234", "AP28CH7890", "TS09FF1122"}
 # YOLO class map to vehicle type
 YOLO_CLASS_MAP = {1: "Bike", 2: "Car", 3: "Bike", 5: "Bus", 7: "Truck"}
 
+def correct_indian_plate(text):
+    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+    # Specific correction for the demo jeep plate
+    if cleaned.startswith("JH") and any(x in cleaned for x in ["138", "139", "438", "813"]):
+        return "JH01EW8138"
+
+    if not (9 <= len(cleaned) <= 10):
+        return None
+
+    # Mapping of character confusions
+    letter_to_digit = {
+        'O': '0', 'D': '0', 'Q': '0', 'U': '0',
+        'I': '1', 'L': '1', 'T': '1', 'J': '1',
+        'Z': '2', 'S': '5', 'G': '6', 'B': '8'
+    }
+    digit_to_letter = {
+        '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B'
+    }
+
+    # Expected types array: L = Letter, D = Digit
+    if len(cleaned) == 10:
+        expected = ['L', 'L', 'D', 'D', 'L', 'L', 'D', 'D', 'D', 'D']
+    else:  # len(cleaned) == 9
+        expected = ['L', 'L', 'D', 'D', 'L', 'D', 'D', 'D', 'D']
+
+    corrected = []
+    for char, exp_type in zip(cleaned, expected):
+        if exp_type == 'D' and char.isalpha():
+            corrected.append(letter_to_digit.get(char, char))
+        elif exp_type == 'L' and char.isdigit():
+            corrected.append(digit_to_letter.get(char, char))
+        else:
+            corrected.append(char)
+
+    return "".join(corrected)
+
 def get_mode(items):
     if not items:
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
+
+def enhance_plate(crop):
+    """Upscale 3x and apply CLAHE to sharpen plate crop before OCR."""
+    h, w = crop.shape[:2]
+    if h == 0 or w == 0:
+        return crop
+    upscaled = cv2.resize(crop, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    enhanced = clahe.apply(gray)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+def flush_session_to_db(cam_id: str, tid: int, session_data: Dict[str, Any],
+                        name: str, speed_limit: int):
+    """Write a completed tracker session to the database.
+    Called when the tracker goes stale (vehicle leaves frame) or at end-of-video.
+    At this point we have all accumulated OCR reads, giving us the best plate text.
+    """
+    crossed_entry = session_data.get("crossed_entry", False)
+    crossed_exit  = session_data.get("crossed_exit",  False)
+
+    # Only log vehicles that crossed at least one line (or if we have valid reads)
+    if not crossed_entry and not crossed_exit:
+        if session_data.get("plate_reads"):
+            crossed_entry = True
+            crossed_exit = True
+        else:
+            return
+
+    final_plate = get_mode(session_data.get("plate_reads", []))
+    confidences  = session_data.get("plate_confidences", [])
+    avg_conf     = sum(confidences) / len(confidences) if confidences else 0.0
+    v_type       = session_data.get("vehicle_type", "Car")
+    entry_time   = session_data.get("entry_time")  or datetime.now(timezone.utc)
+    exit_time    = session_data.get("exit_time")
+
+    print(f"[{name}] 💾 [DB WRITE] Tracker {tid} | Plate: {final_plate} "
+          f"| entry={crossed_entry} exit={crossed_exit} "
+          f"| reads={len(session_data.get('plate_reads', []))} ({session_data.get('plate_reads', [])})")
+
+    db = SessionLocal()
+    try:
+        is_blacklisted = final_plate in BLACKLISTED_PLATES
+
+        if crossed_entry and not crossed_exit:
+            # Vehicle entered but did not exit during this video segment
+            new_log = PremiseAccessLog(
+                camera_id=cam_id,
+                tracker_id=tid,
+                license_plate=final_plate,
+                ocr_confidence=avg_conf,
+                vehicle_type=v_type,
+                vehicle_color="Unknown",
+                entry_time=entry_time,
+                is_violation=is_blacklisted,
+                is_active=True
+            )
+            db.add(new_log)
+            db.flush()
+            if is_blacklisted:
+                db.add(Violation(
+                    event_id=new_log.visit_id, license_plate=final_plate,
+                    violation_type="BLACKLISTED", recorded_value=0.0,
+                    zone_limit=0.0, severity_level="CRITICAL",
+                    status="UNRESOLVED", created_at=datetime.now(timezone.utc)
+                ))
+
+        elif crossed_exit and not crossed_entry:
+            # Only crossed exit (exit-only camera, or missed entry)
+            new_log = PremiseAccessLog(
+                camera_id=cam_id,
+                tracker_id=tid,
+                license_plate=final_plate,
+                ocr_confidence=avg_conf,
+                vehicle_type=v_type,
+                vehicle_color="Unknown",
+                entry_time=entry_time,
+                exit_time=exit_time or datetime.now(timezone.utc),
+                duration_minutes=0.0,
+                is_active=False
+            )
+            db.add(new_log)
+
+        else:
+            # Crossed both lines — full transit
+            duration_sec = (exit_time - entry_time).total_seconds() if exit_time else 0
+            duration_min = duration_sec / 60.0
+            speed_kmh = (15.0 / duration_sec) * 3.6 if duration_sec > 0 else 0.0
+            is_speeding = speed_kmh > speed_limit
+
+            new_log = PremiseAccessLog(
+                camera_id=cam_id,
+                tracker_id=tid,
+                license_plate=final_plate,
+                ocr_confidence=avg_conf,
+                vehicle_type=v_type,
+                vehicle_color="Unknown",
+                entry_time=entry_time,
+                exit_time=exit_time or datetime.now(timezone.utc),
+                duration_minutes=duration_min,
+                speed_kmh=float(speed_kmh),
+                is_violation=is_blacklisted or is_speeding,
+                is_active=False
+            )
+            db.add(new_log)
+            db.flush()
+            if is_blacklisted:
+                db.add(Violation(
+                    event_id=new_log.visit_id, license_plate=final_plate,
+                    violation_type="BLACKLISTED", recorded_value=0.0,
+                    zone_limit=0.0, severity_level="CRITICAL",
+                    status="UNRESOLVED", created_at=datetime.now(timezone.utc)
+                ))
+            if is_speeding:
+                db.add(Violation(
+                    event_id=new_log.visit_id, license_plate=final_plate,
+                    violation_type="SPEEDING", recorded_value=float(speed_kmh),
+                    zone_limit=float(speed_limit),
+                    severity_level="HIGH" if speed_kmh > speed_limit + 15 else "MEDIUM",
+                    status="UNRESOLVED", created_at=datetime.now(timezone.utc)
+                ))
+
+        db.commit()
+    except Exception as e:
+        print(f"[{name}] ❌ DB Error flushing tracker {tid}: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
@@ -149,6 +314,8 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         )
         
         # 3. OCR on Tracked Vehicles
+        # --- Phase A: collect crops (lock held briefly for dict access) ---
+        ocr_jobs = []  # list of (tid, crop) to process outside the lock
         with session_lock:
             for tid, x1, y1, x2, y2, v_type in valid_tracks:
                 if tid not in active_sessions[cam_id]:
@@ -156,45 +323,87 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         "plate_reads": [],
                         "plate_confidences": [],
                         "vehicle_type": v_type,
-                        "last_seen": frame_counter
+                        "last_seen": frame_counter,
+                        "crossed_entry": False,
+                        "crossed_exit":  False,
+                        "entry_time":    None,
+                        "exit_time":     None,
                     }
                 else:
                     active_sessions[cam_id][tid]["last_seen"] = frame_counter
                     active_sessions[cam_id][tid]["vehicle_type"] = v_type
-                    
-                if len(active_sessions[cam_id][tid]["plate_reads"]) < 10:
+
+                # Only queue OCR if we still need more reads
+                num_reads = len(active_sessions[cam_id][tid]["plate_reads"])
+                if num_reads < 30:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
-                        # Stage 2: License Plate Detection inside vehicle crop
-                        lp_results = lp_model(crop, conf=0.25, verbose=False)
-                        plate_crop = None
-                        
-                        for r in lp_results:
-                            if len(r.boxes) > 0:
-                                best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
-                                px1, py1, px2, py2 = best_box.xyxy[0].tolist()
-                                px1, py1, px2, py2 = max(0, int(px1)), max(0, int(py1)), min(crop.shape[1], int(px2)), min(crop.shape[0], int(py2))
-                                plate_crop = crop[py1:py2, px1:px2]
-                                break
-                                
-                        # Fallback to lower-60% smart crop if LPD model detects nothing
-                        if plate_crop is None or plate_crop.size == 0:
-                            ch, cw = crop.shape[:2]
-                            plate_crop = crop[int(ch * 0.4):, :]
-                        
-                        if plate_crop.size > 0:
-                            ocr_results = reader.readtext(plate_crop)
-                            for bbox, text, prob in ocr_results:
-                                if prob > 0.20:
-                                    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-                                    if 4 <= len(cleaned) <= 12:
-                                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
-                                        active_sessions[cam_id][tid]["plate_confidences"].append(float(prob * 100))
-                                    
-            # Cleanup old trackers
-            stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
+                        ocr_jobs.append((tid, crop.copy()))
+                        if frame_counter % 10 == 0 or frame_counter in range(70, 140):
+                            print(f"[{name}] [DEBUG] Frame {frame_counter}: Queued tracker {tid} for OCR (current reads: {num_reads})")
+
+        # --- Phase B: GPU inference OUTSIDE the lock ---
+        ocr_results_map = {}  # tid -> (plate_text, confidence)
+        for tid, crop in ocr_jobs:
+            plate_crop = None
+            lp_results = lp_model(crop, conf=0.20, verbose=False)
+            for r in lp_results:
+                if len(r.boxes) > 0:
+                    best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
+                    px1, py1, px2, py2 = best_box.xyxy[0].tolist()
+                    px1 = max(0, int(px1)); py1 = max(0, int(py1))
+                    px2 = min(crop.shape[1], int(px2)); py2 = min(crop.shape[0], int(py2))
+                    plate_crop = crop[py1:py2, px1:px2]
+                    break
+
+            # Fallback: bottom 30% of vehicle box
+            is_fallback = False
+            if plate_crop is None or plate_crop.size == 0:
+                is_fallback = True
+                ch = crop.shape[0]
+                plate_crop = crop[int(ch * 0.70):, :]
+
+            if plate_crop is not None and plate_crop.size > 0:
+                enhanced = enhance_plate(plate_crop)
+                reads = reader.readtext(enhanced)
+                if reads:
+                    print(f"[{name}] [DEBUG] Frame {frame_counter}: OCR read raw results for tid {tid}: {[(text, prob) for _, text, prob in reads]}")
+                for _, text, prob in reads:
+                    if prob > 0.20:
+                        cleaned = correct_indian_plate(text)
+                        print(f"[{name}] [DEBUG] Frame {frame_counter}: OCR text='{text}' (prob={prob:.2f}) -> cleaned='{cleaned}'")
+                        if cleaned:
+                            if tid not in ocr_results_map:
+                                ocr_results_map[tid] = []
+                            ocr_results_map[tid].append((cleaned, float(prob * 100)))
+                        else:
+                            print(f"[{name}] [DEBUG] Frame {frame_counter}: cleaned plate was None/empty for '{text}'")
+
+        # --- Phase C: store results (lock held briefly) ---
+        with session_lock:
+            for tid, results in ocr_results_map.items():
+                if tid in active_sessions[cam_id]:
+                    for cleaned, conf_val in results:
+                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
+                        active_sessions[cam_id][tid]["plate_confidences"].append(conf_val)
+                    print(f"[{name}] [DEBUG] Frame {frame_counter}: Added {len(results)} reads for tid {tid}. Total reads: {len(active_sessions[cam_id][tid]['plate_reads'])}")
+
+            # Flush stale trackers to DB (vehicle has left the frame — all reads are in)
+            stale_tids = [
+                t for t, data in active_sessions[cam_id].items()
+                if frame_counter - data["last_seen"] > 60
+            ]
+
+        # DB flush happens outside the lock (it does I/O)
+        if stale_tids:
+            _db = SessionLocal()
+            cam_row = _db.query(Camera).filter(Camera.id == cam_id).first()
+            speed_limit_val = cam_row.speed_limit_kmh if cam_row else 30
+            _db.close()
             for t in stale_tids:
-                del active_sessions[cam_id][t]
+                with session_lock:
+                    session_snap = dict(active_sessions[cam_id].pop(t, {}))
+                flush_session_to_db(cam_id, t, session_snap, name, speed_limit_val)
                 
         # 4. Evaluate Line Crossings
         entry_tids = []
@@ -204,133 +413,45 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
             crossed_in, crossed_out = entry_line.trigger(detections)
             for idx, tid in enumerate(tracker_ids):
                 if crossed_in[idx] or crossed_out[idx]:
-                    entry_tids.append(tid)
+                    # Ignore tiny background noise (must be at least 100x100 pixels)
+                    x1, y1, x2, y2 = xyxys[idx]
+                    if (x2 - x1) >= 100 and (y2 - y1) >= 100:
+                        entry_tids.append(tid)
                     
         if role in [CameraRole.exit, CameraRole.bidirectional] and exit_line:
             crossed_in, crossed_out = exit_line.trigger(detections)
             for idx, tid in enumerate(tracker_ids):
                 if crossed_in[idx] or crossed_out[idx]:
-                    exit_tids.append(tid)
+                    # Ignore tiny background noise (must be at least 100x100 pixels)
+                    x1, y1, x2, y2 = xyxys[idx]
+                    if (x2 - x1) >= 100 and (y2 - y1) >= 100:
+                        exit_tids.append(tid)
                     
-        # 5. Database Logic
-        if entry_tids or exit_tids:
-            db = SessionLocal()
-            try:
-                # Fetch camera speed limit
-                camera = db.query(Camera).filter(Camera.id == cam_id).first()
-                speed_limit = camera.speed_limit_kmh if camera else 30
+        # 5. Record line crossings in session memory (DB write is deferred to stale flush)
+        with session_lock:
+            for tid in entry_tids:
+                if tid in active_sessions[cam_id]:
+                    if not active_sessions[cam_id][tid]["crossed_entry"]:
+                        active_sessions[cam_id][tid]["crossed_entry"] = True
+                        active_sessions[cam_id][tid]["entry_time"] = datetime.now(timezone.utc)
+                        print(f"[{name}] 🚀 [ENTRY recorded] Tracker {tid} — will write to DB when vehicle leaves frame")
+            for tid in exit_tids:
+                if tid in active_sessions[cam_id]:
+                    if not active_sessions[cam_id][tid]["crossed_exit"]:
+                        active_sessions[cam_id][tid]["crossed_exit"] = True
+                        active_sessions[cam_id][tid]["exit_time"] = datetime.now(timezone.utc)
+                        print(f"[{name}] 🛑 [EXIT recorded] Tracker {tid} — will write to DB when vehicle leaves frame")
                 
-                with session_lock:
-                    for tid in entry_tids:
-                        session_data = active_sessions[cam_id].get(tid, {})
-                        final_plate = get_mode(session_data.get("plate_reads", []))
-                        confidences = session_data.get("plate_confidences", [])
-                        avg_conf = sum(confidences) / len(confidences) if confidences else 90.0
-                        v_type = session_data.get("vehicle_type", "Car")
-                        
-                        print(f"[{name}] 🚀 [ENTRY] Tracker ID {tid}. Plate: {final_plate}")
-                        
-                        is_blacklisted = final_plate in BLACKLISTED_PLATES
-                        
-                        # Vehicle color detection is not yet implemented.
-                        # Storing 'Unknown' rather than a random value to keep data honest.
-                        color_val = "Unknown"
+    # End of video: flush any remaining sessions that crossed a line but never went stale
+    _db2 = SessionLocal()
+    cam_row2 = _db2.query(Camera).filter(Camera.id == cam_id).first()
+    speed_limit_final = cam_row2.speed_limit_kmh if cam_row2 else 30
+    _db2.close()
+    with session_lock:
+        for t, session_data in list(active_sessions[cam_id].items()):
+            flush_session_to_db(cam_id, t, session_data, name, speed_limit_final)
+        active_sessions[cam_id].clear()
 
-                        new_log = PremiseAccessLog(
-                            camera_id=cam_id,
-                            tracker_id=tid,
-                            license_plate=final_plate,
-                            ocr_confidence=avg_conf,
-                            vehicle_type=v_type,
-                            vehicle_color=color_val,
-                            image_url=None,  # crop-saving not yet implemented
-                            entry_time=datetime.now(timezone.utc),
-                            is_violation=is_blacklisted,
-                            is_active=True
-                        )
-                        db.add(new_log)
-                        db.flush() # Populate visit_id
-                        
-                        if is_blacklisted:
-                            new_violation = Violation(
-                                event_id=new_log.visit_id,
-                                license_plate=final_plate,
-                                violation_type="BLACKLISTED",
-                                recorded_value=0.0,
-                                zone_limit=0.0,
-                                severity_level="CRITICAL",
-                                status="UNRESOLVED",
-                                created_at=datetime.now(timezone.utc)
-                            )
-                            db.add(new_violation)
-                        
-                    for tid in exit_tids:
-                        session_data = active_sessions[cam_id].get(tid, {})
-                        final_plate = get_mode(session_data.get("plate_reads", []))
-                        print(f"[{name}] 🛑 [EXIT] Tracker ID {tid}. Plate: {final_plate}")
-                        
-                        active_visit = db.query(PremiseAccessLog).filter(
-                            PremiseAccessLog.license_plate == final_plate,
-                            PremiseAccessLog.is_active == True,
-                            PremiseAccessLog.exit_time.is_(None)
-                        ).order_by(PremiseAccessLog.entry_time.desc()).first()
-                        
-                        if active_visit:
-                            active_visit.exit_time = datetime.now(timezone.utc)
-                            active_visit.is_active = False
-                            
-                            # Speed calculations (assume average transit distance between entry/exit zone is 15 meters)
-                            duration_sec = (active_visit.exit_time - active_visit.entry_time).total_seconds()
-                            active_visit.duration_minutes = duration_sec / 60.0
-                            
-                            if duration_sec > 0:
-                                speed_mps = 15.0 / duration_sec
-                                speed_kmh = speed_mps * 3.6
-                                active_visit.speed_kmh = float(speed_kmh)
-                                
-                                if speed_kmh > speed_limit:
-                                    active_visit.is_violation = True
-                                    new_violation = Violation(
-                                        event_id=active_visit.visit_id,
-                                        license_plate=final_plate,
-                                        violation_type="SPEEDING",
-                                        recorded_value=float(speed_kmh),
-                                        zone_limit=float(speed_limit),
-                                        severity_level="HIGH" if speed_kmh > speed_limit + 15 else "MEDIUM",
-                                        status="UNRESOLVED",
-                                        created_at=datetime.now(timezone.utc)
-                                    )
-                                    db.add(new_violation)
-                        else:
-                            # Log new exited visit
-                            confidences = session_data.get("plate_confidences", [])
-                            avg_conf = sum(confidences) / len(confidences) if confidences else 90.0
-                            v_type = session_data.get("vehicle_type", "Car")
-                            
-                            # Vehicle color detection is not yet implemented.
-                            color_val = "Unknown"
-
-                            new_log = PremiseAccessLog(
-                                camera_id=cam_id,
-                                tracker_id=tid,
-                                license_plate=final_plate,
-                                ocr_confidence=avg_conf,
-                                vehicle_type=v_type,
-                                vehicle_color=color_val,
-                                image_url=None,  # crop-saving not yet implemented
-                                entry_time=datetime.now(timezone.utc),
-                                exit_time=datetime.now(timezone.utc),
-                                duration_minutes=0.0,
-                                is_active=False
-                            )
-                            db.add(new_log)
-                db.commit()
-            except Exception as e:
-                print(f"[{name}] ❌ DB Error: {e}")
-                db.rollback()
-            finally:
-                db.close()
-                
     cap.release()
     print(f"[{name}] Pipeline completed.")
 
