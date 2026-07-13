@@ -41,7 +41,7 @@ export function LiveEventsTable() {
       if (selectedType !== 'ALL') {
         const type = e.vehicle_type.toLowerCase();
         if (selectedType === 'SPEEDING') {
-          matchType = e.is_violation && e.speed_kmh !== undefined && e.speed_kmh > (cameras.find(c => c.camera_id === e.camera_id)?.speed_limit_kmh ?? 60);
+          matchType = e.is_violation && e.speed_kmh !== undefined && e.speed_kmh > (cameras.find(c => c.id === e.camera_id)?.speed_limit_kmh ?? 60);
         } else if (selectedType === 'BLACKLISTED') {
           matchType = e.is_violation && !e.speed_kmh;
         } else {
@@ -104,8 +104,8 @@ export function LiveEventsTable() {
           <SelectContent className="bg-popover border-border text-foreground rounded-md shadow-md">
             <SelectItem value="ALL">All Cameras</SelectItem>
             {cameras.map(c => (
-              <SelectItem key={c.camera_id} value={c.camera_id}>
-                {c.camera_id} — {c.location_name}
+              <SelectItem key={c.id} value={c.id}>
+                {c.name}
               </SelectItem>
             ))}
           </SelectContent>

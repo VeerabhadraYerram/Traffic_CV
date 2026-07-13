@@ -69,24 +69,17 @@ export function useAnalytics(timeframe: 'day' | 'week' | 'month' = 'day') {
     };
 
     events.forEach(event => {
-      const type = event.vehicle_type.split(' ').slice(1).join(' '); // Extract vehicle type name
-      let found = false;
+      // vehicle_type is stored as bare strings e.g. "Car", "Bike", "Truck", "Bus"
+      const type = event.vehicle_type ?? '';
+      let matched = false;
       for (const key of Object.keys(groups)) {
         if (type.toLowerCase().includes(key.toLowerCase())) {
           groups[key]++;
-          found = true;
+          matched = true;
           break;
         }
       }
-      if (!found) {
-        // Fallback checks
-        const lowerVal = event.vehicle_type.toLowerCase();
-        if (lowerVal.includes('car') || lowerVal.includes('sedan') || lowerVal.includes('suv') || lowerVal.includes('hatch')) groups['Car']++;
-        else if (lowerVal.includes('bike') || lowerVal.includes('motor')) groups['Bike']++;
-        else if (lowerVal.includes('truck')) groups['Truck']++;
-        else if (lowerVal.includes('bus')) groups['Bus']++;
-        else groups['Other']++;
-      }
+      if (!matched) groups['Other']++;
     });
 
     return Object.entries(groups)
@@ -140,9 +133,9 @@ export function useAnalytics(timeframe: 'day' | 'week' | 'month' = 'day') {
       // Find camera by event
       const event = events.find(e => e.event_id === v.event_id);
       if (event) {
-        // Resolve camera name
-        const camera = cameras.find(c => c.camera_id === event.camera_id);
-        const name = camera ? camera.location_name : event.camera_id;
+        // Find camera by matching UUID
+        const camera = cameras.find(c => c.id === event.camera_id);
+        const name = camera ? camera.name : event.camera_id;
         counts[name] = (counts[name] || 0) + 1;
       }
     });

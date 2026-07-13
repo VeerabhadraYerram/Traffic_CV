@@ -136,11 +136,11 @@ def get_events():
                 "ocr_confidence": float(log.ocr_confidence) if log.ocr_confidence is not None else 92.5,
                 "vehicle_type": log.vehicle_type or "Car",
                 "vehicle_color": log.vehicle_color or "White",
-                "image_url": log.image_url or "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?w=600&auto=format&fit=crop&q=80",
+                "image_url": log.image_url or None,
                 "entry_time": log.entry_time.isoformat() if log.entry_time else None,
                 "exit_time": log.exit_time.isoformat() if log.exit_time else None,
                 "duration_minutes": float(log.duration_minutes) if log.duration_minutes is not None else None,
-                "speed_kmh": float(log.speed_kmh) if log.speed_kmh is not None else 25.0,
+                "speed_kmh": float(log.speed_kmh) if log.speed_kmh is not None else None,
                 "is_violation": bool(log.is_violation)
             })
         return result

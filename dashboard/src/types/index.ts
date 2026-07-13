@@ -1,12 +1,35 @@
-export interface Camera {
+
+
+export interface NormalizedLine {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+/** Full camera shape as returned by /api/cameras.
+ *  The endpoint merges both the configurator fields and the dashboard fields
+ *  into one object — this interface covers the complete response. */
+export interface ConfiguratorCamera {
+  // Configurator fields
+  id: string;
+  name: string;
+  role: string;
+  video_source: string;
+  entry_line: NormalizedLine | null;
+  exit_line: NormalizedLine | null;
+  // Dashboard fields (same endpoint, merged response)
   camera_id: string;
   location_name: string;
   latitude: number;
   longitude: number;
-  status: 'ACTIVE' | 'OFFLINE' | 'MAINTENANCE';
+  status: string;
   ip_address?: string;
   speed_limit_kmh: number;
 }
+
+/** Alias — used by tracking/analytics components that only need dashboard fields. */
+export type Camera = ConfiguratorCamera;
 
 export interface VehicleEvent {
   event_id: string;

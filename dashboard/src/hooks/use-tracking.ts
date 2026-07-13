@@ -26,7 +26,7 @@ export function useTracking(searchPlate: string) {
     // Map events to camera locations with coordinates
     const nodes = matchedEvents
       .map(event => {
-        const camera = cameras.find(c => c.camera_id === event.camera_id);
+        const camera = cameras.find(c => c.id === event.camera_id);
         return {
           event,
           camera
@@ -38,8 +38,8 @@ export function useTracking(searchPlate: string) {
     const routePath = nodes.map(n => ({
       lat: n.camera.latitude,
       lng: n.camera.longitude,
-      camera_id: n.camera.camera_id,
-      location_name: n.camera.location_name,
+      camera_id: n.camera.id,
+      location_name: n.camera.name,
       timestamp: n.event.entry_time
     }));
 

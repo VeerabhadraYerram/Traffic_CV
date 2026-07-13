@@ -6,6 +6,7 @@ import { RootLayout } from '@/components/layout/RootLayout';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { TrackingPage } from '@/pages/TrackingPage';
 import { AnalyticsPage } from '@/pages/AnalyticsPage';
+import { ConfiguratorPage } from '@/pages/ConfiguratorPage';
 
 function App() {
   return (
@@ -19,6 +20,7 @@ function App() {
                 <Route path="dashboard" element={<DashboardPage />} />
                 <Route path="tracking" element={<TrackingPage />} />
                 <Route path="analytics" element={<AnalyticsPage />} />
+                <Route path="configurator" element={<ConfiguratorPage />} />
                 <Route path="*" element={<Navigate to="/dashboard" replace />} />
               </Route>
             </Routes>

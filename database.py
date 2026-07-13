@@ -51,27 +51,30 @@ def init_db():
         conn.commit()
 
     Base.metadata.create_all(bind=engine)
-    
-    # Run seed function
+
+    # Run seed function (cameras only — no mock events)
     db = SessionLocal()
     try:
         seed_data(db)
     finally:
         db.close()
 
-def seed_data(db):
-    from models import Camera, PremiseAccessLog, Violation, CameraRole
-    import random
-    from datetime import datetime, timedelta
 
-    # Check if we have cameras
+def seed_data(db):
+    """Seeds the 8 campus cameras on first boot. No mock events are created —
+    all access logs will come exclusively from the live pipeline processing
+    /app/downloads/test_video.mp4."""
+    from models import Camera, CameraRole
+
+    # Skip if cameras already exist
     camera_count = db.query(Camera).count()
     if camera_count > 0:
+        print("Cameras already present — skipping seed.")
         return
-        
-    print("Database is empty. Seeding cameras, events, and violations...")
-    
-    mock_cameras = [
+
+    print("Database is empty. Seeding 8 cameras (no mock events)...")
+
+    cameras = [
         Camera(
             id="a0e0a0a0-0000-0000-0000-000000000001",
             name="Main Entrance (Gate 1)",
@@ -169,80 +172,10 @@ def seed_data(db):
             ip_address="192.168.10.18",
             speed_limit_kmh=20,
             is_active=False
-        )
+        ),
     ]
-    
-    for cam in mock_cameras:
+
+    for cam in cameras:
         db.add(cam)
     db.commit()
-
-    vehicles = [
-        ("TS08EX1234", "Car", "Red", True),
-        ("AP28CH7890", "Car", "Black", True),
-        ("TS07HB9999", "Bike", "Black", False),
-        ("TS09FF1122", "Car", "White", True),
-        ("TS08AJ5566", "Car", "Silver", False),
-        ("AP29BK4321", "Car", "Grey", False),
-        ("TS08EF2020", "Truck", "Yellow", False),
-        ("TS07NK8765", "Bus", "White", False),
-        ("TS08ER4321", "Car", "Blue", False),
-        ("TS07AF9988", "Bike", "Red", False)
-    ]
-
-    cams = db.query(Camera).filter(Camera.is_active == True).all()
-    if not cams:
-        return
-
-    now = datetime.utcnow()
-    for i in range(40):
-        plate, v_type, color, is_blacklisted = random.choice(vehicles)
-        cam = random.choice(cams)
-
-        is_speeding = not is_blacklisted and random.random() < 0.15
-        is_violation = is_blacklisted or is_speeding
-
-        speed = random.randint(35, 55) if is_speeding else random.randint(15, 29)
-        ocr_conf = random.uniform(85, 99)
-
-        entry_time = now - timedelta(minutes=i * 20 + random.randint(0, 10))
-        exit_time = entry_time + timedelta(seconds=random.randint(10, 120)) if random.random() > 0.2 else None
-        duration = (exit_time - entry_time).total_seconds() / 60.0 if exit_time else None
-
-        log = PremiseAccessLog(
-            camera_id=cam.id,
-            tracker_id=100 + i,
-            license_plate=plate,
-            ocr_confidence=ocr_conf,
-            vehicle_type=v_type,
-            vehicle_color=color,
-            image_url=f"https://images.unsplash.com/photo-{1549399542 + (i % 5)}-7e3f8b79c341?w=600&auto=format&fit=crop&q=80",
-            entry_time=entry_time,
-            exit_time=exit_time,
-            duration_minutes=duration,
-            speed_kmh=float(speed),
-            is_violation=is_violation,
-            is_active=False if exit_time else True
-        )
-        db.add(log)
-        db.flush()
-
-        if is_violation:
-            v_type_str = "BLACKLISTED" if is_blacklisted else "SPEEDING"
-            rec_val = 0.0 if is_blacklisted else float(speed)
-            limit_val = 0.0 if is_blacklisted else float(cam.speed_limit_kmh)
-            sev = "CRITICAL" if is_blacklisted else ("HIGH" if speed > cam.speed_limit_kmh + 15 else "MEDIUM")
-
-            vio = Violation(
-                event_id=log.visit_id,
-                license_plate=plate,
-                violation_type=v_type_str,
-                recorded_value=rec_val,
-                zone_limit=limit_val,
-                severity_level=sev,
-                status="UNRESOLVED" if random.random() > 0.4 else "ACKNOWLEDGED",
-                created_at=entry_time
-            )
-            db.add(vio)
-
-    db.commit()
-    print("Database successfully seeded.")
+    print("✅ 8 cameras seeded. Awaiting real pipeline data.")

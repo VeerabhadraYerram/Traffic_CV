@@ -1,4 +1,4 @@
-import { LayoutDashboard, Map, BarChart3, Activity, ShieldAlert, Settings, HelpCircle } from 'lucide-react';
+import { LayoutDashboard, Map, BarChart3, Activity, ShieldAlert, HelpCircle, SlidersHorizontal } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
 import {
@@ -30,6 +30,11 @@ export function AppSidebar() {
       name: 'Traffic Analytics',
       path: '/analytics',
       icon: BarChart3,
+    },
+    {
+      name: 'Camera Configurator',
+      path: '/configurator',
+      icon: SlidersHorizontal,
     },
   ];
 
@@ -121,11 +126,7 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter className="p-4 border-t border-sidebar-border">
-        <div className="flex items-center justify-between text-xs text-slate-500">
-          <a href="/static/configurator.html" className="flex items-center gap-2 cursor-pointer hover:text-slate-300 text-slate-500 decoration-none">
-            <Settings className="h-4 w-4" />
-            <span>Config</span>
-          </a>
+        <div className="flex items-center justify-end text-xs text-slate-500">
           <div className="flex items-center gap-1 cursor-pointer hover:text-slate-300">
             <HelpCircle className="h-4 w-4" />
             <span>Help</span>

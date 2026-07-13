@@ -50,3 +50,7 @@ env/
 *.jpeg
 *.png
 *.pt
+
+
+models
+
