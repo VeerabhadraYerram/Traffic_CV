@@ -31,15 +31,14 @@ BLACKLISTED_PLATES = {"TS08EX1234", "AP28CH7890", "TS09FF1122"}
 YOLO_CLASS_MAP = {1: "Bike", 2: "Car", 3: "Bike", 5: "Bus", 7: "Truck"}
 
 def correct_indian_plate(text):
+    # Clean text to keep only alphanumeric uppercase characters
     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
-    # Specific correction for the demo jeep plate
-    if cleaned.startswith("JH") and any(x in cleaned for x in ["138", "139", "438", "813"]):
-        return "JH01EW8138"
-
-    if not (9 <= len(cleaned) <= 10):
+    
+    # Valid Indian plates are typically between 7 and 11 characters long
+    if not (7 <= len(cleaned) <= 11):
         return None
 
-    # Mapping of character confusions
+    # Mappings for character corrections
     letter_to_digit = {
         'O': '0', 'D': '0', 'Q': '0', 'U': '0',
         'I': '1', 'L': '1', 'T': '1', 'J': '1',
@@ -49,27 +48,109 @@ def correct_indian_plate(text):
         '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B'
     }
 
-    # Expected types array: L = Letter, D = Digit
-    if len(cleaned) == 10:
-        expected = ['L', 'L', 'D', 'D', 'L', 'L', 'D', 'D', 'D', 'D']
-    else:  # len(cleaned) == 9
-        expected = ['L', 'L', 'D', 'D', 'L', 'D', 'D', 'D', 'D']
+    def force_letters(s):
+        return "".join(digit_to_letter.get(c, c) if c.isdigit() else c for c in s)
 
-    corrected = []
-    for char, exp_type in zip(cleaned, expected):
-        if exp_type == 'D' and char.isalpha():
-            corrected.append(letter_to_digit.get(char, char))
-        elif exp_type == 'L' and char.isdigit():
-            corrected.append(digit_to_letter.get(char, char))
+    def force_digits(s):
+        return "".join(letter_to_digit.get(c, c) if c.isalpha() else c for c in s)
+
+    # 1. State Code (first 2 characters must be letters)
+    state = force_letters(cleaned[0:2])
+    
+    # 2. Number suffix (last 1 to 4 characters must be digits)
+    max_num_len = min(4, len(cleaned) - 3)  # Leave at least 3 chars for state (2) + RTO (1)
+    num_part = force_digits(cleaned[-max_num_len:])
+    
+    # The middle part is everything between the State and the Number suffix
+    mid_part = cleaned[2:-max_num_len]
+    
+    # 3. Parse Middle Part: [RTO Code (1-2 digits)] [Series (0-3 letters)]
+    if len(mid_part) == 0:
+        rto = ""
+        series = ""
+    else:
+        # Determine if RTO is 1 or 2 characters.
+        # If second character looks like a digit, RTO is 2 characters; otherwise 1 character.
+        if len(mid_part) >= 2:
+            c2 = mid_part[1]
+            is_c2_digit = c2.isdigit() or c2 in letter_to_digit
+            if is_c2_digit:
+                rto = force_digits(mid_part[0:2])
+                series = force_letters(mid_part[2:])
+            else:
+                rto = force_digits(mid_part[0:1])
+                series = force_letters(mid_part[1:])
         else:
-            corrected.append(char)
+            rto = force_digits(mid_part[0:1])
+            series = ""
 
-    return "".join(corrected)
+    return state + rto + series + num_part
+
+def align_to_template(s):
+    cleaned = re.sub(r'[^A-Z0-9]', '', s.upper())
+    if len(cleaned) == 10:
+        return cleaned
+        
+    if len(cleaned) == 9:
+        # e.g., JH0EM8138 (9 characters) or DL3CA1234 (9 characters)
+        # Check if it has: State (2 letters) + Mid (3 chars) + Num (4 digits)
+        state = cleaned[0:2]
+        num = cleaned[-4:]
+        mid = cleaned[2:-4]
+        if len(mid) == 3 and state.isalpha() and num.isdigit():
+            # Split mid into digits and letters
+            digits = "".join(c for c in mid if c.isdigit())
+            letters = "".join(c for c in mid if c.isalpha())
+            # Standard mid is 2 digits + 2 letters = 4 characters.
+            # If we have 1 digit and 2 letters (e.g. 0 + EM), we pad digits to 2:
+            if len(digits) == 1 and len(letters) == 2:
+                return state + digits + "?" + letters + num
+            # If we have 2 digits and 1 letter (e.g. 01 + E), we pad letters to 2:
+            elif len(digits) == 2 and len(letters) == 1:
+                return state + digits + letters + "?" + num
+                
+    return cleaned
 
 def get_mode(items):
     if not items:
         return "UNKNOWN"
-    return Counter(items).most_common(1)[0][0]
+        
+    # Align all reads using the alignment helper
+    aligned_reads = []
+    for item in items:
+        aligned = align_to_template(item)
+        if aligned:
+            aligned_reads.append(aligned)
+            
+    if not aligned_reads:
+        return Counter(items).most_common(1)[0][0]
+        
+    # Vote character-by-character on the aligned strings
+    # Since aligned strings can be of length 10 or 11 (if RJ01ESP7199),
+    # let's find the most common length of the aligned strings.
+    lengths = [len(r) for r in aligned_reads]
+    common_len = Counter(lengths).most_common(1)[0][0]
+    
+    # Filter reads to only those matching the most common length
+    filtered_reads = [r for r in aligned_reads if len(r) == common_len]
+    
+    consensus_chars = []
+    for i in range(common_len):
+        chars_at_pos = [read[i] for read in filtered_reads if read[i] != "?"]
+        if chars_at_pos:
+            most_common_char = Counter(chars_at_pos).most_common(1)[0][0]
+            consensus_chars.append(most_common_char)
+        else:
+            consensus_chars.append("?")
+            
+    consensus_str = "".join(consensus_chars)
+    
+    # Clean the consensus string using correct_indian_plate
+    corrected = correct_indian_plate(consensus_str)
+    if corrected:
+        return corrected
+        
+    return consensus_str
 
 def enhance_plate(crop):
     """Upscale 3x and apply CLAHE to sharpen plate crop before OCR."""
