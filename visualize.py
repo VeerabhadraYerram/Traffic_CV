@@ -1,3 +1,19 @@
+'''
+Traffic Camera Visualization Script
+
+Generates a debug video (output_video.mp4) containing:
+1. YOLO bounding boxes
+2. OCR License Plate reads
+3. Configured Entry/Exit line overlays
+
+How to Run:
+docker compose run --rm app python visualize.py
+(This will automatically grab the first active camera in your database and use its video)
+
+Optional - To run on a specific camera:
+docker compose run --rm app python visualize.py --camera "Test Video Bidirectional"
+'''
+
 import os
 import re
 import cv2
@@ -10,6 +26,7 @@ from dotenv import load_dotenv
 from database import SessionLocal
 from models import Camera, CameraRole
 from ultralytics import YOLO
+import argparse
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import easyocr
 import torch
@@ -26,13 +43,20 @@ def main():
     print("🎥 Starting Debug Visualization Script")
     print("=====================================")
     
+    parser = argparse.ArgumentParser(description="Visualize Traffic Camera")
+    parser.add_argument("--camera", type=str, help="Name of the camera to visualize (defaults to the first active camera)")
+    args = parser.parse_args()
+
     # Connect to DB to get exact lines
     db = SessionLocal()
-    # Fetch the camera explicitly requested by the user
-    cam = db.query(Camera).filter(Camera.name.ilike("%Test Video Bidirectional%")).first()
     
+    if args.camera:
+        cam = db.query(Camera).filter(Camera.name.ilike(f"%{args.camera}%")).first()
+    else:
+        cam = db.query(Camera).filter(Camera.is_active == True).first()
+        
     if not cam:
-        print("❌ Could not find 'Test Video Bidirectional' in the database.")
+        print("❌ Could not find an active camera in the database. Please add one first.")
         db.close()
         return
         
@@ -42,8 +66,11 @@ def main():
     print(f"Exit Line Config: {cam.exit_line_normalized}")
     db.close()
     
-    video_path = "/app/downloads/test_video.mp4"
-    output_path = "/app/downloads/output_video.mp4"
+    video_path = cam.video_source.strip("'\"")
+    
+    # Generate output path (e.g. /app/downloads/video_output.mp4)
+    base_name, ext = os.path.splitext(video_path)
+    output_path = f"{base_name}_output{ext}"
     
     if not os.path.exists(video_path):
         print(f"⚠️ Video not found: {video_path}")
