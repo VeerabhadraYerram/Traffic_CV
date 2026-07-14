@@ -51,38 +51,75 @@ N2L = {
 
 def correct_indian_plate(text):
     text = text.strip().upper()
+    
+    # Strip common IND prefix (which often shifts index positions)
+    if len(text) >= 3 and text[:3] in ["IND", "1ND", "IMD", "IID"]:
+        text = text[3:]
+        
     if len(text) < 4:
         return text
         
     chars = list(text)
     
-    # 1. First 2 characters must be letters (State code)
+    # 1. Pre-pass: Force expected character types at the extreme ends to assist block parsing
     for idx in [0, 1]:
         if chars[idx].isdigit():
             chars[idx] = N2L.get(chars[idx], chars[idx])
             
-    # 2. Next 2 characters must be digits (RTO code)
+    last_four_start = max(2, len(text) - 4)
+    for idx in range(last_four_start, len(text)):
+        if chars[idx].isalpha():
+            chars[idx] = L2N.get(chars[idx], chars[idx])
+            
+    cleaned_text = "".join(chars)
+    
+    # 2. Dynamic block parser: Group into alternating groups of letters and numbers
+    blocks = []
+    current_block = []
+    current_is_digit = None
+    
+    for char in cleaned_text:
+        is_digit = char.isdigit()
+        if current_is_digit is None:
+            current_is_digit = is_digit
+            current_block.append(char)
+        elif is_digit == current_is_digit:
+            current_block.append(char)
+        else:
+            blocks.append(("digit" if current_is_digit else "letter", "".join(current_block)))
+            current_is_digit = is_digit
+            current_block.append(char)
+    if current_block:
+        blocks.append(("digit" if current_is_digit else "letter", "".join(current_block)))
+        
+    # 3. If we have exactly 4 alternating blocks, enforce strict type rules on each block
+    if len(blocks) == 4 and blocks[0][0] == "letter" and blocks[1][0] == "digit" and blocks[2][0] == "letter" and blocks[3][0] == "digit":
+        b0_val = blocks[0][1]
+        b1_val = blocks[1][1]
+        b2_val = blocks[2][1]
+        b3_val = blocks[3][1]
+        
+        b0_corr = "".join(N2L.get(c, c) for c in b0_val)
+        b1_corr = "".join(L2N.get(c, c) for c in b1_val)
+        b2_corr = "".join(N2L.get(c, c) for c in b2_val)
+        b3_corr = "".join(L2N.get(c, c) for c in b3_val)
+        
+        return b0_corr + b1_corr + b2_corr + b3_corr
+        
+    # 4. Fallback to positional corrector if blocks are merged or shifted
     for idx in [2, 3]:
         if chars[idx].isalpha():
             chars[idx] = L2N.get(chars[idx], chars[idx])
             
-    # 3. Last 4 characters must be digits (Unique vehicle number)
-    if len(text) >= 8:
-        last_four_start = len(text) - 4
-        for idx in range(last_four_start, len(text)):
-            if chars[idx].isalpha():
-                chars[idx] = L2N.get(chars[idx], chars[idx])
-                
-        # 4. Middle characters must be letters (Series, e.g. indices between RTO and unique number)
+    if len(chars) >= 8:
         for idx in range(4, last_four_start):
             if chars[idx].isdigit():
                 chars[idx] = N2L.get(chars[idx], chars[idx])
     else:
-        # If plate is shorter than 8 characters, treat all remaining characters as digits
-        for idx in range(4, len(text)):
+        for idx in range(4, len(chars)):
             if chars[idx].isalpha():
                 chars[idx] = L2N.get(chars[idx], chars[idx])
-            
+                
     return "".join(chars)
 
 def preprocess_plate_crop(crop):
@@ -288,11 +325,24 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                                 text_threshold=0.3,
                                 low_text=0.2
                             )
-                            for bbox, text, prob in ocr_results:
-                                if prob > 0.15:
-                                    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                            if ocr_results:
+                                # Group and sort detected text boxes (top-to-bottom for lines, left-to-right on same line)
+                                sorted_results = []
+                                for bbox, text, prob in ocr_results:
+                                    x_center = sum(pt[0] for pt in bbox) / 4.0
+                                    y_center = sum(pt[1] for pt in bbox) / 4.0
+                                    sorted_results.append((x_center, y_center, text, prob))
+                                
+                                # Sort by y-center (grouped in 15px bands for multi-line support) then x-center
+                                sorted_results.sort(key=lambda item: (item[1] // 15, item[0]))
+                                
+                                joined_text = "".join(item[2] for item in sorted_results)
+                                avg_prob = sum(item[3] for item in sorted_results) / len(sorted_results)
+                                cleaned = re.sub(r'[^A-Z0-9]', '', joined_text.upper())
+                                
+                                if avg_prob > 0.15:
                                     if 4 <= len(cleaned) <= 12:
-                                        active_sessions[cam_id][tid]["plate_reads"].append((cleaned, prob))
+                                        active_sessions[cam_id][tid]["plate_reads"].append((cleaned, avg_prob))
                                     
             # Cleanup old trackers
             stale_tids = [t for t, data in active_sessions[cam_id].items() if frame_counter - data["last_seen"] > 150]
