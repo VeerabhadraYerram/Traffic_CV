@@ -50,37 +50,38 @@ N2L = {
 }
 
 def correct_indian_plate(text):
-    # Standard Indian HSRP format: State(2 L) + RTO(2 N) + Series(1-2 L) + Num(4 N)
-    if not (9 <= len(text) <= 10):
+    text = text.strip().upper()
+    if len(text) < 4:
         return text
         
     chars = list(text)
     
-    # 1. Correct State Code (chars 0, 1 must be letters)
+    # 1. First 2 characters must be letters (State code)
     for idx in [0, 1]:
         if chars[idx].isdigit():
             chars[idx] = N2L.get(chars[idx], chars[idx])
             
-    state_code = "".join(chars[:2])
-    # Only proceed with correction if the start matches a valid Indian state/UT code
-    if state_code not in VALID_STATE_CODES:
-        return text
-            
-    # 2. Correct RTO Code (chars 2, 3 must be digits)
+    # 2. Next 2 characters must be digits (RTO code)
     for idx in [2, 3]:
         if chars[idx].isalpha():
             chars[idx] = L2N.get(chars[idx], chars[idx])
             
-    # 3. Correct Last 4 characters (must be digits)
-    last_four_start = len(text) - 4
-    for idx in range(last_four_start, len(text)):
-        if chars[idx].isalpha():
-            chars[idx] = L2N.get(chars[idx], chars[idx])
-            
-    # 4. Correct Series characters (indices between RTO and unique number: index 4, or 4 and 5)
-    for idx in range(4, last_four_start):
-        if chars[idx].isdigit():
-            chars[idx] = N2L.get(chars[idx], chars[idx])
+    # 3. Last 4 characters must be digits (Unique vehicle number)
+    if len(text) >= 8:
+        last_four_start = len(text) - 4
+        for idx in range(last_four_start, len(text)):
+            if chars[idx].isalpha():
+                chars[idx] = L2N.get(chars[idx], chars[idx])
+                
+        # 4. Middle characters must be letters (Series, e.g. indices between RTO and unique number)
+        for idx in range(4, last_four_start):
+            if chars[idx].isdigit():
+                chars[idx] = N2L.get(chars[idx], chars[idx])
+    else:
+        # If plate is shorter than 8 characters, treat all remaining characters as digits
+        for idx in range(4, len(text)):
+            if chars[idx].isalpha():
+                chars[idx] = L2N.get(chars[idx], chars[idx])
             
     return "".join(chars)
 
