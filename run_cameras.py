@@ -32,19 +32,74 @@ def get_mode(items):
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
 
+VALID_STATE_CODES = {
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA", "GJ", 
+    "HR", "HP", "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML", "MN", "MP", 
+    "MZ", "NL", "OD", "PB", "PY", "RJ", "SK", "TN", "TS", "TR", "UA", "UK", 
+    "UP", "WB", "BH"
+}
+
+# Letter-to-number map for digit columns
+L2N = {
+    'I': '1', 'L': '1', 'J': '1', 'S': '5', 'O': '0', 'D': '0', 'B': '8', 'G': '6', 'Z': '2', 'T': '7'
+}
+
+# Number-to-letter map for character columns
+N2L = {
+    '1': 'I', '5': 'S', '0': 'O', '8': 'B', '2': 'Z', '6': 'G', '7': 'T'
+}
+
+def correct_indian_plate(text):
+    # Standard Indian HSRP format: State(2 L) + RTO(2 N) + Series(1-2 L) + Num(4 N)
+    if not (9 <= len(text) <= 10):
+        return text
+        
+    chars = list(text)
+    
+    # 1. Correct State Code (chars 0, 1 must be letters)
+    for idx in [0, 1]:
+        if chars[idx].isdigit():
+            chars[idx] = N2L.get(chars[idx], chars[idx])
+            
+    state_code = "".join(chars[:2])
+    # Only proceed with correction if the start matches a valid Indian state/UT code
+    if state_code not in VALID_STATE_CODES:
+        return text
+            
+    # 2. Correct RTO Code (chars 2, 3 must be digits)
+    for idx in [2, 3]:
+        if chars[idx].isalpha():
+            chars[idx] = L2N.get(chars[idx], chars[idx])
+            
+    # 3. Correct Last 4 characters (must be digits)
+    last_four_start = len(text) - 4
+    for idx in range(last_four_start, len(text)):
+        if chars[idx].isalpha():
+            chars[idx] = L2N.get(chars[idx], chars[idx])
+            
+    # 4. Correct Series characters (indices between RTO and unique number: index 4, or 4 and 5)
+    for idx in range(4, last_four_start):
+        if chars[idx].isdigit():
+            chars[idx] = N2L.get(chars[idx], chars[idx])
+            
+    return "".join(chars)
+
 def preprocess_plate_crop(crop):
     if crop is None or crop.size == 0:
         return crop
     # 1. Convert to grayscale
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # 2. Apply CLAHE to equalize contrast locally (handles glare and shadows)
+    # 2. Apply Bilateral Filter (on original small size to make it extremely fast)
+    denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+    # 3. Apply CLAHE to equalize contrast locally (handles glare and shadows)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    equalized = clahe.apply(gray)
-    # 3. Resize by 2.5x to make characters larger and sharper
+    equalized = clahe.apply(denoised)
+    # 4. Resize by 2.5x to make characters larger and sharper
     resized = cv2.resize(equalized, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
-    # 4. Apply Bilateral Filter to reduce noise while keeping edges sharp
-    denoised = cv2.bilateralFilter(resized, 9, 75, 75)
-    return denoised
+    # 5. Apply Unsharp Masking (sharpening filter)
+    blurred = cv2.GaussianBlur(resized, (0, 0), 3)
+    sharpened = cv2.addWeighted(resized, 1.5, blurred, -0.5, 0)
+    return sharpened
 
 def get_final_plate(reads):
     if not reads:
@@ -63,18 +118,25 @@ def get_final_plate(reads):
     most_common_len = Counter(lengths).most_common(1)[0][0]
     
     # Filter readings matching the most common length
-    same_len_reads = [text for text, prob in valid_reads if len(text) == most_common_len]
+    same_len_reads = [(text, prob) for text, prob in valid_reads if len(text) == most_common_len]
     
     if not same_len_reads:
         return sorted(valid_reads, key=lambda x: x[1], reverse=True)[0][0]
         
-    # Column-wise/character-wise majority voting to correct individual character errors
+    # Column-wise/character-wise confidence-weighted voting to correct individual character errors
     final_chars = []
     for i in range(most_common_len):
-        chars_at_i = [text[i] for text in same_len_reads]
-        final_chars.append(Counter(chars_at_i).most_common(1)[0][0])
+        char_confidences = {}
+        for text, prob in same_len_reads:
+            char = text[i]
+            char_confidences[char] = char_confidences.get(char, 0.0) + prob
         
-    return "".join(final_chars)
+        best_char = max(char_confidences, key=char_confidences.get)
+        final_chars.append(best_char)
+        
+    candidate = "".join(final_chars)
+    # Apply regional Indian Plate syntax correction rules
+    return correct_indian_plate(candidate)
 
 def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
@@ -201,8 +263,8 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                 else:
                     active_sessions[cam_id][tid]["last_seen"] = frame_counter
                     
-                # Collect up to 30 reads along the vehicle's trajectory to capture close-up frames
-                if len(active_sessions[cam_id][tid]["plate_reads"]) < 30:
+                # Only scan once every 3 frames to save CPU/GPU cycles, staggering vehicles
+                if len(active_sessions[cam_id][tid]["plate_reads"]) < 30 and (frame_counter - tid) % 3 == 0:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
                         # Smart Crop: Focus on the bottom 60% of the car to find the plate
