@@ -26,6 +26,8 @@ def init_db():
         conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'ACTIVE';"))
         conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS ip_address TEXT;"))
         conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS speed_limit_kmh INTEGER DEFAULT 30;"))
+        conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS speed_polygon_normalized JSONB;"))
+        conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS distance_between_lines_meters DOUBLE PRECISION DEFAULT 15.0;"))
 
         conn.execute(text("ALTER TABLE premise_access_logs ADD COLUMN IF NOT EXISTS ocr_confidence DOUBLE PRECISION;"))
         conn.execute(text("ALTER TABLE premise_access_logs ADD COLUMN IF NOT EXISTS vehicle_type TEXT DEFAULT 'Car';"))

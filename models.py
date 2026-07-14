@@ -27,6 +27,8 @@ class Camera(Base):
     status = Column(String, default="ACTIVE")
     ip_address = Column(String)
     speed_limit_kmh = Column(Integer, default=30)
+    speed_polygon_normalized = Column(JSONB)
+    distance_between_lines_meters = Column(Float)
 
 class PremiseAccessLog(Base):
     __tablename__ = "premise_access_logs"

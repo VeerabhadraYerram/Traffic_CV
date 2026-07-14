@@ -8,3 +8,4 @@ deep-sort-realtime
 easyocr
 fastapi
 uvicorn
+python-multipart
