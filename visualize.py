@@ -96,16 +96,21 @@ def preprocess_plate_crop(crop):
         return crop
     # 1. Convert to grayscale
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # 2. Apply Bilateral Filter (on original small size to make it extremely fast)
-    denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-    # 3. Apply CLAHE to equalize contrast locally (handles glare and shadows)
+    # 2. Dynamic scaling: Ensure the crop is at least 300 pixels wide for OCR
+    h, w = gray.shape[:2]
+    if w < 300:
+        scale = 300.0 / w
+        resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    else:
+        resized = gray
+    # 3. Apply Bilateral Filter to reduce noise while keeping edges sharp
+    denoised = cv2.bilateralFilter(resized, 9, 75, 75)
+    # 4. Apply CLAHE to equalize contrast locally (handles glare and shadows)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     equalized = clahe.apply(denoised)
-    # 4. Resize by 2.5x to make characters larger and sharper
-    resized = cv2.resize(equalized, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
     # 5. Apply Unsharp Masking (sharpening filter)
-    blurred = cv2.GaussianBlur(resized, (0, 0), 3)
-    sharpened = cv2.addWeighted(resized, 1.5, blurred, -0.5, 0)
+    blurred = cv2.GaussianBlur(equalized, (0, 0), 3)
+    sharpened = cv2.addWeighted(equalized, 1.5, blurred, -0.5, 0)
     return sharpened
 
 def get_final_plate(reads):
@@ -280,20 +285,23 @@ def main():
             if len(active_sessions[tid]["plate_reads"]) < 30 and (frame_counter - tid) % 3 == 0:
                 crop = frame[y1:y2, x1:x2]
                 if crop.size > 0:
-                    # Smart Crop: Focus on the bottom 60% of the car to find the plate
+                    # Smart Crop: Focus on bottom 60% if large; use full crop if car is small/far away
                     ch, cw = crop.shape[:2]
-                    plate_crop = crop[int(ch * 0.4):, :]
+                    if ch < 100:
+                        plate_crop = crop
+                    else:
+                        plate_crop = crop[int(ch * 0.4):, :]
                     
                     if plate_crop.size > 0:
                         preprocessed_crop = preprocess_plate_crop(plate_crop)
                         ocr_results = reader.readtext(
                             preprocessed_crop,
                             allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                            text_threshold=0.5,
-                            low_text=0.3
+                            text_threshold=0.3,
+                            low_text=0.2
                         )
                         for _, text, prob in ocr_results:
-                            if prob > 0.2:
+                            if prob > 0.15:
                                 cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                 if 4 <= len(cleaned) <= 12:
                                     active_sessions[tid]["plate_reads"].append((cleaned, prob))
