@@ -9,7 +9,7 @@
  * satisfies hook imports without doing anything.
  */
 
-import type { ConfiguratorCamera, NormalizedLine, VehicleEvent, Violation } from '@/types';
+import type { ConfiguratorCamera, NormalizedLine, NormalizedPoint, VehicleEvent, Violation } from '@/types';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -82,12 +82,14 @@ export const dataService = {
       }
     ),
 
-  /** Saves normalized entry/exit line coords for a camera. */
+  /** Saves normalized entry/exit line coords, speed polygon, and distance for a camera. */
   saveCameraLines: (
     cameraId: string,
     payload: {
       entry_line?: NormalizedLine | null;
       exit_line?: NormalizedLine | null;
+      speed_polygon?: NormalizedPoint[] | null;
+      distance_between_lines_meters?: number | null;
     }
   ) =>
     apiFetch<{ status: string; message: string }>(
@@ -98,4 +100,17 @@ export const dataService = {
         body: JSON.stringify(payload),
       }
     ),
+
+  /** Uploads a video file for a specific camera */
+  uploadVideo: (cameraId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiFetch<{ status: string; message: string; video_source: string }>(
+      `/api/cameras/${cameraId}/video`,
+      {
+        method: 'POST',
+        body: formData,
+      }
+    );
+  },
 };

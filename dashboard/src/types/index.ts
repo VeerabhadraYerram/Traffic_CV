@@ -7,6 +7,11 @@ export interface NormalizedLine {
   y2: number;
 }
 
+export interface NormalizedPoint {
+  x: number;
+  y: number;
+}
+
 /** Full camera shape as returned by /api/cameras.
  *  The endpoint merges both the configurator fields and the dashboard fields
  *  into one object — this interface covers the complete response. */
@@ -18,6 +23,8 @@ export interface ConfiguratorCamera {
   video_source: string;
   entry_line: NormalizedLine | null;
   exit_line: NormalizedLine | null;
+  speed_polygon_normalized: NormalizedPoint[] | null;
+  distance_between_lines_meters: number | null;
   // Dashboard fields (same endpoint, merged response)
   camera_id: string;
   location_name: string;
