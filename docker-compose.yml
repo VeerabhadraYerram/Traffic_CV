@@ -19,7 +19,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
       - PYTHONUNBUFFERED=1
-
+    shm_size: '4gb'
     volumes:
       # Map the local codebase for instant code reloads
       - ./:/app
@@ -34,13 +34,13 @@ services:
       - db
 
     # Uncomment this block below to run on NVIDIA GPUs natively (60+ FPS):
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   web:
     build: .

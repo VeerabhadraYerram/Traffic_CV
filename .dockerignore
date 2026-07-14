@@ -9,6 +9,3 @@ dashboard/build
 data/downloads
 downloads/*.mp4
 downloads/*.exe
-*.pt
-*.gguf
-models/*.gguf
