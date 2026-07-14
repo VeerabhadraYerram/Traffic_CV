@@ -328,6 +328,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
     
     speed_estimator = None
     if speed_polygon_normalized:
@@ -420,6 +421,13 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         ocr_jobs = []  # list of (tid, crop) to process outside the lock
         if True:
             for tid, x1, y1, x2, y2, v_type in valid_tracks:
+                inst_speed = 0.0
+                if speed_estimator:
+                    bottom_center = (int((x1+x2)/2), int(y2))
+                    # Fallback to 30 fps if fps is missing/zero
+                    safe_fps = fps if fps and fps > 0 else 30.0
+                    inst_speed = speed_estimator.update_and_get_speed(tid, bottom_center, current_time=frame_counter/safe_fps)
+                    
                 if tid not in active_sessions:
                     active_sessions[tid] = {
                         "plate_reads": [],
