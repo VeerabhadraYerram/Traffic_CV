@@ -301,12 +301,15 @@ def main():
                             low_text=0.2
                         )
                         for _, text, prob in ocr_results:
+                            cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+                            print(f"   [Frame {frame_counter}] Tracker {tid} Raw OCR: '{text}' (conf: {prob:.2f}) -> Cleaned: '{cleaned}'")
                             if prob > 0.15:
-                                cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                 if 4 <= len(cleaned) <= 12:
                                     active_sessions[tid]["plate_reads"].append((cleaned, prob))
             
             current_plate = get_final_plate(active_sessions[tid]["plate_reads"])
+            if len(active_sessions[tid]["plate_reads"]) > 0 and frame_counter % 25 == 0:
+                print(f" 🗳️ [Tracker {tid}] Current Consensus: {current_plate} (Total reads: {len(active_sessions[tid]['plate_reads'])})")
             if current_plate == "UNKNOWN":
                 labels.append(f"#{tid}")
             else:
