@@ -43,20 +43,44 @@ def preprocess_plate_crop(crop):
         return crop
     # 1. Convert to grayscale
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # 2. Resize by 2x to make characters larger and sharper
-    resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    # 3. Apply Bilateral Filter to reduce noise while keeping edges sharp
+    # 2. Apply CLAHE to equalize contrast locally (handles glare and shadows)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(gray)
+    # 3. Resize by 2.5x to make characters larger and sharper
+    resized = cv2.resize(equalized, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    # 4. Apply Bilateral Filter to reduce noise while keeping edges sharp
     denoised = cv2.bilateralFilter(resized, 9, 75, 75)
     return denoised
 
 def get_final_plate(reads):
     if not reads:
         return "UNKNOWN"
-    # Sort reads by confidence probability in descending order
-    sorted_reads = sorted(reads, key=lambda x: x[1], reverse=True)
-    # Take the top 10 highest confidence readings
-    top_texts = [text for text, prob in sorted_reads[:10]]
-    return get_mode(top_texts)
+    # Filter reads to valid length range (standard plates are 5-12 chars)
+    valid_reads = [(text, prob) for text, prob in reads if 5 <= len(text) <= 12]
+    if not valid_reads:
+        return "UNKNOWN"
+    
+    # If we only have 1 or 2 reads, return the one with highest confidence
+    if len(valid_reads) <= 2:
+        return sorted(valid_reads, key=lambda x: x[1], reverse=True)[0][0]
+        
+    # Find most common length among all readings
+    lengths = [len(text) for text, prob in valid_reads]
+    most_common_len = Counter(lengths).most_common(1)[0][0]
+    
+    # Filter readings matching the most common length
+    same_len_reads = [text for text, prob in valid_reads if len(text) == most_common_len]
+    
+    if not same_len_reads:
+        return sorted(valid_reads, key=lambda x: x[1], reverse=True)[0][0]
+        
+    # Column-wise/character-wise majority voting to correct individual character errors
+    final_chars = []
+    for i in range(most_common_len):
+        chars_at_i = [text[i] for text in same_len_reads]
+        final_chars.append(Counter(chars_at_i).most_common(1)[0][0])
+        
+    return "".join(final_chars)
 
 def main():
     print("=====================================")
@@ -141,8 +165,8 @@ def main():
     entry_color = sv.Color(r=0, g=255, b=0) # Green for Entry
     exit_color = sv.Color(r=0, g=0, b=255) # Red for Exit
     
-    entry_line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=1, color=entry_color)
-    exit_line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=1, color=exit_color)
+    entry_line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=1, color=entry_color, display_in_count=False, display_out_count=False)
+    exit_line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=1, color=exit_color, display_in_count=False, display_out_count=False)
 
     active_sessions = {}
     frame_counter = 0
@@ -198,9 +222,14 @@ def main():
                     
                     if plate_crop.size > 0:
                         preprocessed_crop = preprocess_plate_crop(plate_crop)
-                        ocr_results = reader.readtext(preprocessed_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                        ocr_results = reader.readtext(
+                            preprocessed_crop,
+                            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                            text_threshold=0.5,
+                            low_text=0.3
+                        )
                         for _, text, prob in ocr_results:
-                            if prob > 0.3:
+                            if prob > 0.2:
                                 cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                 if 4 <= len(cleaned) <= 12:
                                     active_sessions[tid]["plate_reads"].append((cleaned, prob))
@@ -231,8 +260,23 @@ def main():
         # Annotate Lines (Always draw them even if no detections)
         if entry_line:
             frame = entry_line_annotator.annotate(frame=frame, line_counter=entry_line)
+            total_entries = entry_line.in_count + entry_line.out_count
+            mx = int((entry_line.vector.start.x + entry_line.vector.end.x) / 2)
+            my = int((entry_line.vector.start.y + entry_line.vector.end.y) / 2) - 15
+            text = f"Entries: {total_entries}"
+            (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (mx - text_w // 2 - 10, my - text_h - 10), (mx + text_w // 2 + 10, my + 5), (0, 0, 0), -1)
+            cv2.putText(frame, text, (mx - text_w // 2, my - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            
         if exit_line:
             frame = exit_line_annotator.annotate(frame=frame, line_counter=exit_line)
+            total_exits = exit_line.in_count + exit_line.out_count
+            mx = int((exit_line.vector.start.x + exit_line.vector.end.x) / 2)
+            my = int((exit_line.vector.start.y + exit_line.vector.end.y) / 2) - 15
+            text = f"Exits: {total_exits}"
+            (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (mx - text_w // 2 - 10, my - text_h - 10), (mx + text_w // 2 + 10, my + 5), (0, 0, 0), -1)
+            cv2.putText(frame, text, (mx - text_w // 2, my - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
         # 4. Save Frame
         out.write(frame)

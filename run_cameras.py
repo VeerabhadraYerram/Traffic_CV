@@ -32,25 +32,49 @@ def get_mode(items):
         return "UNKNOWN"
     return Counter(items).most_common(1)[0][0]
 
-def get_final_plate(reads):
-    if not reads:
-        return "UNKNOWN"
-    # Sort reads by confidence probability in descending order
-    sorted_reads = sorted(reads, key=lambda x: x[1], reverse=True)
-    # Take the top 10 highest confidence readings
-    top_texts = [text for text, prob in sorted_reads[:10]]
-    return get_mode(top_texts)
-
 def preprocess_plate_crop(crop):
     if crop is None or crop.size == 0:
         return crop
     # 1. Convert to grayscale
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    # 2. Resize by 2x to make characters larger and sharper
-    resized = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    # 3. Apply Bilateral Filter to reduce noise while keeping edges sharp
+    # 2. Apply CLAHE to equalize contrast locally (handles glare and shadows)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(gray)
+    # 3. Resize by 2.5x to make characters larger and sharper
+    resized = cv2.resize(equalized, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    # 4. Apply Bilateral Filter to reduce noise while keeping edges sharp
     denoised = cv2.bilateralFilter(resized, 9, 75, 75)
     return denoised
+
+def get_final_plate(reads):
+    if not reads:
+        return "UNKNOWN"
+    # Filter reads to valid length range (standard plates are 5-12 chars)
+    valid_reads = [(text, prob) for text, prob in reads if 5 <= len(text) <= 12]
+    if not valid_reads:
+        return "UNKNOWN"
+    
+    # If we only have 1 or 2 reads, return the one with highest confidence
+    if len(valid_reads) <= 2:
+        return sorted(valid_reads, key=lambda x: x[1], reverse=True)[0][0]
+        
+    # Find most common length among all readings
+    lengths = [len(text) for text, prob in valid_reads]
+    most_common_len = Counter(lengths).most_common(1)[0][0]
+    
+    # Filter readings matching the most common length
+    same_len_reads = [text for text, prob in valid_reads if len(text) == most_common_len]
+    
+    if not same_len_reads:
+        return sorted(valid_reads, key=lambda x: x[1], reverse=True)[0][0]
+        
+    # Column-wise/character-wise majority voting to correct individual character errors
+    final_chars = []
+    for i in range(most_common_len):
+        chars_at_i = [text[i] for text in same_len_reads]
+        final_chars.append(Counter(chars_at_i).most_common(1)[0][0])
+        
+    return "".join(final_chars)
 
 def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
@@ -187,9 +211,14 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         
                         if plate_crop.size > 0:
                             preprocessed_crop = preprocess_plate_crop(plate_crop)
-                            ocr_results = reader.readtext(preprocessed_crop, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
+                            ocr_results = reader.readtext(
+                                preprocessed_crop,
+                                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                                text_threshold=0.5,
+                                low_text=0.3
+                            )
                             for bbox, text, prob in ocr_results:
-                                if prob > 0.3:
+                                if prob > 0.2:
                                     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
                                     if 4 <= len(cleaned) <= 12:
                                         active_sessions[cam_id][tid]["plate_reads"].append((cleaned, prob))
@@ -236,15 +265,27 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         final_plate = get_final_plate(active_sessions[cam_id].get(tid, {}).get("plate_reads", []))
                         print(f"[{name}] 🛑 [EXIT] Tracker ID {tid}. Plate: {final_plate}")
                         
+                        # Proposal B: First try to find the active entry log by tracker_id (guarantees matching the same car session)
                         active_visit = db.query(PremiseAccessLog).filter(
-                            PremiseAccessLog.license_plate == final_plate,
+                            PremiseAccessLog.camera_id == cam_id,
+                            PremiseAccessLog.tracker_id == tid,
                             PremiseAccessLog.is_active == True,
                             PremiseAccessLog.exit_time.is_(None)
                         ).order_by(PremiseAccessLog.entry_time.desc()).first()
                         
+                        # Fallback: If tracker_id match fails (e.g., tracking ID reset), try matching by plate text
+                        if not active_visit and final_plate != "UNKNOWN":
+                            active_visit = db.query(PremiseAccessLog).filter(
+                                PremiseAccessLog.license_plate == final_plate,
+                                PremiseAccessLog.is_active == True,
+                                PremiseAccessLog.exit_time.is_(None)
+                            ).order_by(PremiseAccessLog.entry_time.desc()).first()
+                        
                         if active_visit:
                             active_visit.exit_time = datetime.utcnow()
                             active_visit.is_active = False
+                            # Retroactively update the entry log's plate to match the final, higher-accuracy exit consensus plate
+                            active_visit.license_plate = final_plate
                         else:
                             new_log = PremiseAccessLog(
                                 camera_id=cam_id,
