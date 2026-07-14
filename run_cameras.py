@@ -2,7 +2,7 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 import re
 import cv2
-import threading
+import multiprocessing
 from datetime import datetime, timezone
 from collections import Counter
 import numpy as np
@@ -19,10 +19,7 @@ import easyocr
 
 load_dotenv()
 
-# Global memory for all cameras
-# Structure: { camera_id: { tracker_id: { "visit_id": uuid, "plate_reads": [], "plate_confidences": [], "vehicle_type": str, "last_seen": timestamp } } }
-active_sessions = {}
-session_lock = threading.Lock()
+
 
 # Blacklist of license plates
 BLACKLISTED_PLATES = {"TS08EX1234", "AP28CH7890", "TS09FF1122"}
@@ -238,7 +235,13 @@ def flush_session_to_db(cam_id: str, tid: int, session_data: Dict[str, Any],
             # Crossed both lines — full transit
             duration_sec = (exit_time - entry_time).total_seconds() if exit_time else 0
             duration_min = duration_sec / 60.0
-            speed_kmh = (15.0 / duration_sec) * 3.6 if duration_sec > 0 else 0.0
+            max_inst_speed = session_data.get("max_speed_kmh", 0.0)
+            if max_inst_speed > 0:
+                speed_kmh = max_inst_speed
+            else:
+                line_dist = session_data.get("distance_between_lines_meters", 15.0)
+                speed_kmh = (line_dist / duration_sec) * 3.6 if duration_sec > 0 else 0.0
+            
             is_speeding = speed_kmh > speed_limit
 
             new_log = PremiseAccessLog(
@@ -280,14 +283,26 @@ def flush_session_to_db(cam_id: str, tid: int, session_data: Dict[str, Any],
     finally:
         db.close()
 
-def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):
+def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm, speed_polygon_normalized, distance_between_lines_meters):
+    from speed_estimator import SpeedEstimator
+    active_sessions = {}
     print(f"[{name}] Starting YOLO11 + DeepSORT pipeline...")
     
     # Initialize YOLO11 Model
-    model = YOLO("yolo11m.pt")
+    import os
+    if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
+        print(f"[{name}] ⚡ Loading TensorRT Engine: yolo11m.engine")
+        model = YOLO("yolo11m.engine", task="detect")
+    else:
+        print(f"[{name}] ℹ️ Loading standard PyTorch Model: yolo11m.pt")
+        model = YOLO("yolo11m.pt")
     
     # Initialize License Plate Detection Model (Stage 2 YOLO)
-    lp_model = YOLO("models/yolov8n_license_plate.pt")
+    try:
+        lp_model = YOLO("models/yolov8n_license_plate.pt")
+    except Exception as e:
+        print(f"[{name}] ⚠️ Custom license plate model not found, falling back to heuristic cropping.")
+        lp_model = None
     
     # Initialize DeepSORT Tracker
     tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
@@ -301,10 +316,7 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
     print(f"[{name}] Initializing EasyOCR Model on {'GPU' if device_is_gpu else 'CPU'}...")
     reader = easyocr.Reader(['en'], gpu=device_is_gpu, verbose=False)
     
-    # Init DB memory for this camera
-    with session_lock:
-        if cam_id not in active_sessions:
-            active_sessions[cam_id] = {}
+
             
     video_source = video_source.strip("'\"")
     
@@ -316,6 +328,15 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    speed_estimator = None
+    if speed_polygon_normalized:
+        speed_estimator = SpeedEstimator(
+            polygon_normalized=speed_polygon_normalized,
+            distance_meters=distance_between_lines_meters or 15.0,
+            frame_width=width,
+            frame_height=height
+        )
     
     entry_line = None
     if entry_line_norm:
@@ -397,10 +418,10 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         # 3. OCR on Tracked Vehicles
         # --- Phase A: collect crops (lock held briefly for dict access) ---
         ocr_jobs = []  # list of (tid, crop) to process outside the lock
-        with session_lock:
+        if True:
             for tid, x1, y1, x2, y2, v_type in valid_tracks:
-                if tid not in active_sessions[cam_id]:
-                    active_sessions[cam_id][tid] = {
+                if tid not in active_sessions:
+                    active_sessions[tid] = {
                         "plate_reads": [],
                         "plate_confidences": [],
                         "vehicle_type": v_type,
@@ -409,13 +430,17 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         "crossed_exit":  False,
                         "entry_time":    None,
                         "exit_time":     None,
+                        "max_speed_kmh": inst_speed,
+                        "distance_between_lines_meters": distance_between_lines_meters or 15.0
                     }
                 else:
-                    active_sessions[cam_id][tid]["last_seen"] = frame_counter
-                    active_sessions[cam_id][tid]["vehicle_type"] = v_type
+                    active_sessions[tid]["last_seen"] = frame_counter
+                    active_sessions[tid]["vehicle_type"] = v_type
+                    if inst_speed > active_sessions[tid].get("max_speed_kmh", 0):
+                        active_sessions[tid]["max_speed_kmh"] = inst_speed
 
                 # Only queue OCR if we still need more reads
-                num_reads = len(active_sessions[cam_id][tid]["plate_reads"])
+                num_reads = len(active_sessions[tid]["plate_reads"])
                 if num_reads < 30:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
@@ -427,15 +452,16 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
         ocr_results_map = {}  # tid -> (plate_text, confidence)
         for tid, crop in ocr_jobs:
             plate_crop = None
-            lp_results = lp_model(crop, conf=0.20, verbose=False)
-            for r in lp_results:
-                if len(r.boxes) > 0:
-                    best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
-                    px1, py1, px2, py2 = best_box.xyxy[0].tolist()
-                    px1 = max(0, int(px1)); py1 = max(0, int(py1))
-                    px2 = min(crop.shape[1], int(px2)); py2 = min(crop.shape[0], int(py2))
-                    plate_crop = crop[py1:py2, px1:px2]
-                    break
+            if lp_model:
+                lp_results = lp_model(crop, conf=0.20, verbose=False)
+                for r in lp_results:
+                    if len(r.boxes) > 0:
+                        best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
+                        px1, py1, px2, py2 = best_box.xyxy[0].tolist()
+                        px1 = max(0, int(px1)); py1 = max(0, int(py1))
+                        px2 = min(crop.shape[1], int(px2)); py2 = min(crop.shape[0], int(py2))
+                        plate_crop = crop[py1:py2, px1:px2]
+                        break
 
             # Fallback: bottom 30% of vehicle box
             is_fallback = False
@@ -461,17 +487,17 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                             print(f"[{name}] [DEBUG] Frame {frame_counter}: cleaned plate was None/empty for '{text}'")
 
         # --- Phase C: store results (lock held briefly) ---
-        with session_lock:
+        if True:
             for tid, results in ocr_results_map.items():
-                if tid in active_sessions[cam_id]:
+                if tid in active_sessions:
                     for cleaned, conf_val in results:
-                        active_sessions[cam_id][tid]["plate_reads"].append(cleaned)
-                        active_sessions[cam_id][tid]["plate_confidences"].append(conf_val)
-                    print(f"[{name}] [DEBUG] Frame {frame_counter}: Added {len(results)} reads for tid {tid}. Total reads: {len(active_sessions[cam_id][tid]['plate_reads'])}")
+                        active_sessions[tid]["plate_reads"].append(cleaned)
+                        active_sessions[tid]["plate_confidences"].append(conf_val)
+                    print(f"[{name}] [DEBUG] Frame {frame_counter}: Added {len(results)} reads for tid {tid}. Total reads: {len(active_sessions[tid]['plate_reads'])}")
 
             # Flush stale trackers to DB (vehicle has left the frame — all reads are in)
             stale_tids = [
-                t for t, data in active_sessions[cam_id].items()
+                t for t, data in active_sessions.items()
                 if frame_counter - data["last_seen"] > 60
             ]
 
@@ -482,9 +508,11 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
             speed_limit_val = cam_row.speed_limit_kmh if cam_row else 30
             _db.close()
             for t in stale_tids:
-                with session_lock:
-                    session_snap = dict(active_sessions[cam_id].pop(t, {}))
+                if True:
+                    session_snap = dict(active_sessions.pop(t, {}))
                 flush_session_to_db(cam_id, t, session_snap, name, speed_limit_val)
+            if speed_estimator:
+                speed_estimator.clean_stale_trackers(active_sessions.keys())
                 
         # 4. Evaluate Line Crossings
         entry_tids = []
@@ -509,18 +537,18 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
                         exit_tids.append(tid)
                     
         # 5. Record line crossings in session memory (DB write is deferred to stale flush)
-        with session_lock:
+        if True:
             for tid in entry_tids:
-                if tid in active_sessions[cam_id]:
-                    if not active_sessions[cam_id][tid]["crossed_entry"]:
-                        active_sessions[cam_id][tid]["crossed_entry"] = True
-                        active_sessions[cam_id][tid]["entry_time"] = datetime.now(timezone.utc)
+                if tid in active_sessions:
+                    if not active_sessions[tid]["crossed_entry"]:
+                        active_sessions[tid]["crossed_entry"] = True
+                        active_sessions[tid]["entry_time"] = datetime.now(timezone.utc)
                         print(f"[{name}] 🚀 [ENTRY recorded] Tracker {tid} — will write to DB when vehicle leaves frame")
             for tid in exit_tids:
-                if tid in active_sessions[cam_id]:
-                    if not active_sessions[cam_id][tid]["crossed_exit"]:
-                        active_sessions[cam_id][tid]["crossed_exit"] = True
-                        active_sessions[cam_id][tid]["exit_time"] = datetime.now(timezone.utc)
+                if tid in active_sessions:
+                    if not active_sessions[tid]["crossed_exit"]:
+                        active_sessions[tid]["crossed_exit"] = True
+                        active_sessions[tid]["exit_time"] = datetime.now(timezone.utc)
                         print(f"[{name}] 🛑 [EXIT recorded] Tracker {tid} — will write to DB when vehicle leaves frame")
                 
     # End of video: flush any remaining sessions that crossed a line but never went stale
@@ -528,10 +556,10 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
     cam_row2 = _db2.query(Camera).filter(Camera.id == cam_id).first()
     speed_limit_final = cam_row2.speed_limit_kmh if cam_row2 else 30
     _db2.close()
-    with session_lock:
-        for t, session_data in list(active_sessions[cam_id].items()):
+    if True:
+        for t, session_data in list(active_sessions.items()):
             flush_session_to_db(cam_id, t, session_data, name, speed_limit_final)
-        active_sessions[cam_id].clear()
+        active_sessions.clear()
 
     cap.release()
     print(f"[{name}] Pipeline completed.")
@@ -539,6 +567,12 @@ def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_
 
 def main():
     import sys
+    import multiprocessing
+    
+    # Must use spawn for PyTorch CUDA compatibility in multiprocessing
+    if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+        multiprocessing.set_start_method('spawn', force=True)
+
     print("Ensuring database schema is up to date...")
     init_db()  # Guarantee schema migrations + camera seed before querying
 
@@ -575,16 +609,16 @@ def main():
         cam_id = str(cam.id)
         role = cam.camera_role
         
-        t = threading.Thread(
+        t = multiprocessing.Process(
             target=process_camera,
-            args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized)
+            args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized, cam.speed_polygon_normalized, cam.distance_between_lines_meters)
         )
         t.start()
         threads.append(t)
         
     db.close()
     
-    print("🚀 All camera threads are running via Postgres ORM & YOLO11 + DeepSORT.")
+    print("🚀 All camera processes are running via Postgres ORM & YOLO11 + DeepSORT.")
     
     try:
         for t in threads:
