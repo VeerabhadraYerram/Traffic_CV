@@ -142,7 +142,6 @@ export function ConfiguratorPage() {
     queryFn: () => dataService.getCameras() as Promise<ConfiguratorCamera[]>,
     staleTime: 60_000,
   });
-  const queryClient = useQueryClient();
 
   const selectedCamera = cameras.find((c) => c.id === selectedId) ?? null;
 

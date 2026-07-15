@@ -92,7 +92,7 @@ export function PipelinePage() {
           ) : (
             <div className="w-full h-full relative flex items-center justify-center bg-black">
               <img 
-                src={`http://localhost:8001/api/stream/${selectedCam}?t=${Date.now()}`}
+                src={`${window.location.protocol}//${window.location.hostname}:8001/api/stream/${selectedCam}?t=${Date.now()}`}
                 alt="Pipeline Live Stream"
                 className="max-w-full max-h-full object-contain"
                 onError={(e) => {

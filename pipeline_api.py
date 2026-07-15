@@ -13,12 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import supervision as sv
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
-import easyocr
+from paddleocr import PaddleOCR
 
 from database import SessionLocal
 from models import Camera, CameraRole
 from speed_estimator import SpeedEstimator
-from run_cameras import YOLO_CLASS_MAP, correct_indian_plate, enhance_plate, flush_session_to_db
+from utils import YOLO_CLASS_MAP, correct_indian_plate, enhance_plate, flush_session_to_db
 
 app = FastAPI()
 
@@ -42,7 +42,7 @@ except:
     lp_model = None
 
 device_is_gpu = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-reader = easyocr.Reader(['en'], gpu=device_is_gpu, verbose=False)
+reader = PaddleOCR(use_angle_cls=True, lang='en')
 
 # Global lock for single-instance pipeline
 pipeline_lock = threading.Lock()
@@ -115,7 +115,6 @@ def generate_frames(cam_id: str):
         
     speed_zone = None
     if speed_polygon_normalized and len(speed_polygon_normalized) >= 3:
-        import numpy as np
         pts = np.array([[int(p['x']*width), int(p['y']*height)] for p in speed_polygon_normalized], dtype=np.int32)
         speed_zone = sv.PolygonZone(polygon=pts)
 
@@ -212,6 +211,10 @@ def generate_frames(cam_id: str):
                 if len(active_sessions[tid]["plate_reads"]) < 30:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0: ocr_jobs.append((tid, crop.copy()))
+            
+            # Prevent CUDA OOM by limiting OCR to top 3 largest vehicles per frame
+            ocr_jobs.sort(key=lambda j: j[1].shape[0] * j[1].shape[1], reverse=True)
+            ocr_jobs = ocr_jobs[:3]
 
             # GPU OCR
             for tid, crop in ocr_jobs:
@@ -229,13 +232,16 @@ def generate_frames(cam_id: str):
 
                 if plate_crop is not None and plate_crop.size > 0:
                     enhanced = enhance_plate(plate_crop)
-                    reads = reader.readtext(enhanced)
-                    for _, text, prob in reads:
-                        if prob > 0.20:
-                            cleaned = correct_indian_plate(text)
-                            if cleaned:
-                                active_sessions[tid]["plate_reads"].append(cleaned)
-                                active_sessions[tid]["plate_confidences"].append(float(prob * 100))
+                    result = reader.ocr(enhanced, cls=True)
+                    if result and result[0]:
+                        for line in result[0]:
+                            text = line[1][0]
+                            prob = line[1][1]
+                            if prob > 0.20:
+                                cleaned = correct_indian_plate(text)
+                                if cleaned:
+                                    active_sessions[tid]["plate_reads"].append(cleaned)
+                                    active_sessions[tid]["plate_confidences"].append(float(prob * 100))
 
             # Database Flush (Stale)
             stale_tids = [t for t, data in active_sessions.items() if frame_counter - data["last_seen"] > 60]
