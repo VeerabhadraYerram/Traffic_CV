@@ -89,6 +89,7 @@ export const dataService = {
       entry_line?: NormalizedLine | null;
       exit_line?: NormalizedLine | null;
       speed_polygon?: NormalizedPoint[] | null;
+      calibration_polygon?: NormalizedPoint[] | null;
       distance_between_lines_meters?: number | null;
     }
   ) =>

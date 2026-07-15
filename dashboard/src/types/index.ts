@@ -24,6 +24,7 @@ export interface ConfiguratorCamera {
   entry_line: NormalizedLine | null;
   exit_line: NormalizedLine | null;
   speed_polygon_normalized: NormalizedPoint[] | null;
+  calibration_polygon_normalized: NormalizedPoint[] | null;
   distance_between_lines_meters: number | null;
   // Dashboard fields (same endpoint, merged response)
   camera_id: string;

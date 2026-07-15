@@ -27,7 +27,8 @@ class Camera(Base):
     status = Column(String, default="ACTIVE")
     ip_address = Column(String)
     speed_limit_kmh = Column(Integer, default=30)
-    speed_polygon_normalized = Column(JSONB)
+    speed_polygon_normalized = Column(JSONB)  # Now supports N points for curved roads
+    calibration_polygon_normalized = Column(JSONB) # 4 points for perspective calibration
     distance_between_lines_meters = Column(Float)
 
 class PremiseAccessLog(Base):
