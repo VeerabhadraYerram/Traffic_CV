@@ -9,7 +9,7 @@ import { cn } from '@/lib/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Tool = 'entry' | 'exit' | 'polygon' | null;
+type Tool = 'entry' | 'exit' | 'polygon' | 'calibration' | null;
 type DrawState = 0 | 1; // 0 = idle, 1 = first point placed
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -116,6 +116,7 @@ export function ConfiguratorPage() {
   const [entryLine, setEntryLine] = useState<NormalizedLine | null>(null);
   const [exitLine, setExitLine] = useState<NormalizedLine | null>(null);
   const [speedPolygon, setSpeedPolygon] = useState<NormalizedPoint[]>([]);
+  const [calibrationPolygon, setCalibrationPolygon] = useState<NormalizedPoint[]>([]);
   const [distance, setDistance] = useState<number>(15.0);
 
   // View Options
@@ -127,6 +128,7 @@ export function ConfiguratorPage() {
   const [drawState, setDrawState] = useState<DrawState>(0);
   const [tempPoint, setTempPoint] = useState<{ x: number; y: number } | null>(null);
   const [tempPolygon, setTempPolygon] = useState<NormalizedPoint[]>([]);
+  const [tempCalibration, setTempCalibration] = useState<NormalizedPoint[]>([]);
   const [previewPoint, setPreviewPoint] = useState<{ x: number; y: number } | null>(null);
   
   const [saving, setSaving] = useState(false);
@@ -140,6 +142,7 @@ export function ConfiguratorPage() {
     queryFn: () => dataService.getCameras() as Promise<ConfiguratorCamera[]>,
     staleTime: 60_000,
   });
+  const queryClient = useQueryClient();
 
   const selectedCamera = cameras.find((c) => c.id === selectedId) ?? null;
 
@@ -151,6 +154,7 @@ export function ConfiguratorPage() {
     setEntryLine(cam?.entry_line ?? null);
     setExitLine(cam?.exit_line ?? null);
     setSpeedPolygon(cam?.speed_polygon_normalized ?? []);
+    setCalibrationPolygon(cam?.calibration_polygon_normalized ?? []);
     setDistance(cam?.distance_between_lines_meters ?? 15.0);
     
     setTool(null);
@@ -158,6 +162,8 @@ export function ConfiguratorPage() {
     setTempPoint(null);
     setPreviewPoint(null);
     setTempPolygon([]);
+    setTempCalibration([]);
+    setTempCalibration([]);
     setFrameError(false);
 
     const img = new Image();
@@ -167,10 +173,16 @@ export function ConfiguratorPage() {
       if (!canvas) return;
       canvas.width = img.width;
       canvas.height = img.height;
-      redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, cam?.speed_polygon_normalized ?? [], null, null, [], null, showEntryExit, showPolygon);
+      redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, cam?.speed_polygon_normalized ?? [], cam?.calibration_polygon_normalized ?? [], null, null, [], [], null, showEntryExit, showPolygon);
     };
     img.onerror = () => setFrameError(true);
     img.src = `/api/cameras/${selectedId}/frame?t=${Date.now()}`;
+    
+    return () => {
+      img.onload = null;
+      img.onerror = null;
+      img.src = '';
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, refreshTrigger]);
 
@@ -181,9 +193,11 @@ export function ConfiguratorPage() {
       entry: NormalizedLine | null,
       exit: NormalizedLine | null,
       polygon: NormalizedPoint[],
+      calibration: NormalizedPoint[],
       preview: { x: number; y: number } | null,
       anchor: { x: number; y: number } | null,
       tPolygon: NormalizedPoint[],
+      tCalibration: NormalizedPoint[],
       activeTool?: Tool,
       sEntryExit?: boolean,
       sPolygon?: boolean
@@ -197,8 +211,8 @@ export function ConfiguratorPage() {
 
       if (img) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-      // Speed Polygon
-      const drawPoly = (points: NormalizedPoint[], isComplete: boolean) => {
+      // Generic Polygon Drawer
+      const drawPoly = (points: NormalizedPoint[], isComplete: boolean, colorStr: string, fillColorStr: string) => {
          if (points.length === 0) return;
          ctx.beginPath();
          ctx.moveTo(points[0].x * canvas.width, points[0].y * canvas.height);
@@ -208,36 +222,55 @@ export function ConfiguratorPage() {
          
          if (isComplete) {
             ctx.closePath();
-            ctx.fillStyle = 'rgba(234, 179, 8, 0.2)'; // Yellow with opacity
+            ctx.fillStyle = fillColorStr;
             ctx.fill();
          }
          
-         ctx.strokeStyle = '#eab308';
+         ctx.strokeStyle = colorStr;
          ctx.lineWidth = 2;
          ctx.stroke();
 
          for (const p of points) {
             ctx.beginPath();
             ctx.arc(p.x * canvas.width, p.y * canvas.height, 5, 0, Math.PI * 2);
-            ctx.fillStyle = '#eab308';
+            ctx.fillStyle = colorStr;
             ctx.fill();
             ctx.strokeStyle = 'white';
             ctx.stroke();
          }
       };
 
-      if (sPolygon && polygon.length === 4) {
-         drawPoly(polygon, true);
+      if (sPolygon && polygon.length >= 3) {
+         drawPoly(polygon, true, '#eab308', 'rgba(234, 179, 8, 0.2)');
       }
 
       if (activeTool === 'polygon' && tPolygon.length > 0) {
-         drawPoly(tPolygon, false);
+         drawPoly(tPolygon, false, '#eab308', 'rgba(234, 179, 8, 0.2)');
          if (preview) {
              ctx.beginPath();
              const last = tPolygon[tPolygon.length - 1];
              ctx.moveTo(last.x * canvas.width, last.y * canvas.height);
              ctx.lineTo(preview.x * canvas.width, preview.y * canvas.height);
              ctx.strokeStyle = '#eab308';
+             ctx.setLineDash([8,4]);
+             ctx.stroke();
+             ctx.setLineDash([]);
+         }
+      }
+
+
+      if (sPolygon && calibration.length === 4) {
+         drawPoly(calibration, true, '#06b6d4', 'rgba(6, 182, 212, 0.2)'); // Cyan
+      }
+
+      if (activeTool === 'calibration' && tCalibration.length > 0) {
+         drawPoly(tCalibration, false, '#06b6d4', 'rgba(6, 182, 212, 0.2)');
+         if (preview) {
+             ctx.beginPath();
+             const last = tCalibration[tCalibration.length - 1];
+             ctx.moveTo(last.x * canvas.width, last.y * canvas.height);
+             ctx.lineTo(preview.x * canvas.width, preview.y * canvas.height);
+             ctx.strokeStyle = '#06b6d4';
              ctx.setLineDash([8,4]);
              ctx.stroke();
              ctx.setLineDash([]);
@@ -279,8 +312,8 @@ export function ConfiguratorPage() {
 
   // trigger redraw whenever lines change
   useEffect(() => {
-    redraw(imageRef.current, entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon);
-  }, [entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon, redraw]);
+    redraw(imageRef.current, entryLine, exitLine, speedPolygon, calibrationPolygon, previewPoint, tempPoint, tempPolygon, tempCalibration, tool, showEntryExit, showPolygon);
+  }, [entryLine, exitLine, speedPolygon, calibrationPolygon, previewPoint, tempPoint, tempPolygon, tempCalibration, tool, showEntryExit, showPolygon, redraw]);
 
   // ── Canvas events ─────────────────────────────────────────────────────────
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -288,14 +321,19 @@ export function ConfiguratorPage() {
     const { normX, normY } = getCanvasCoords(e, canvasRef.current);
 
     if (tool === 'polygon') {
-      const newPoly = [...tempPolygon, { x: normX, y: normY }];
-      if (newPoly.length === 4) {
-          setSpeedPolygon(newPoly);
-          setTempPolygon([]);
+      setTempPolygon([...tempPolygon, { x: normX, y: normY }]);
+      return;
+    }
+    
+    if (tool === 'calibration') {
+      const newCal = [...tempCalibration, { x: normX, y: normY }];
+      if (newCal.length === 4) {
+          setCalibrationPolygon(newCal);
+          setTempCalibration([]);
           setTool(null);
           setPreviewPoint(null);
       } else {
-          setTempPolygon(newPoly);
+          setTempCalibration(newCal);
       }
       return;
     }
@@ -320,6 +358,7 @@ export function ConfiguratorPage() {
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!tool || !canvasRef.current) return;
     if (tool === 'polygon' && tempPolygon.length === 0) return;
+    if (tool === 'calibration' && tempCalibration.length === 0) return;
     if ((tool === 'entry' || tool === 'exit') && drawState !== 1) return;
     
     const { normX, normY } = getCanvasCoords(e, canvasRef.current);
@@ -353,9 +392,11 @@ export function ConfiguratorPage() {
       await dataService.saveCameraLines(selectedId, {
         entry_line: entryLine,
         exit_line: exitLine,
-        speed_polygon: speedPolygon.length === 4 ? speedPolygon : null,
+        speed_polygon: speedPolygon.length >= 3 ? speedPolygon : null,
+        calibration_polygon: calibrationPolygon.length === 4 ? calibrationPolygon : null,
         distance_between_lines_meters: distance
       });
+      queryClient.invalidateQueries({ queryKey: ['cameras'] });
       toast.success('Configuration saved', {
         description: `Tripwire and speed configurations updated for "${selectedCamera?.name}"`,
       });
@@ -371,10 +412,13 @@ export function ConfiguratorPage() {
     setEntryLine(null);
     setExitLine(null);
     setSpeedPolygon([]);
+    setCalibrationPolygon([]);
     setTool(null);
     setDrawState(0);
     setTempPoint(null);
     setTempPolygon([]);
+    setTempCalibration([]);
+    setTempCalibration([]);
     setPreviewPoint(null);
   };
 
@@ -494,6 +538,8 @@ export function ConfiguratorPage() {
                 setDrawState(0);
                 setTempPoint(null);
                 setTempPolygon([]);
+    setTempCalibration([]);
+    setTempCalibration([]);
                 setPreviewPoint(null);
                 setShowEntryExit(true);
               }}
@@ -516,6 +562,8 @@ export function ConfiguratorPage() {
                 setDrawState(0);
                 setTempPoint(null);
                 setTempPolygon([]);
+    setTempCalibration([]);
+    setTempCalibration([]);
                 setPreviewPoint(null);
                 setShowEntryExit(true);
               }}
@@ -538,6 +586,7 @@ export function ConfiguratorPage() {
                 setDrawState(0);
                 setTempPoint(null);
                 setTempPolygon([]);
+                setTempCalibration([]);
                 setPreviewPoint(null);
                 setShowPolygon(true);
               }}
@@ -551,7 +600,45 @@ export function ConfiguratorPage() {
               )}
             >
               <Hexagon className="h-4 w-4" />
-              Draw Speed Polygon
+              Speed ROI Poly
+            </button>
+            
+            {tool === 'polygon' && tempPolygon.length >= 3 && (
+              <button
+                onClick={() => {
+                  setSpeedPolygon(tempPolygon);
+                  setTempPolygon([]);
+                  setTool(null);
+                  setPreviewPoint(null);
+                }}
+                className="flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold transition-all border bg-green-500/15 border-green-500 text-green-600 hover:bg-green-500/25"
+              >
+                <Save className="h-4 w-4" />
+                Finish ROI Poly
+              </button>
+            )}
+
+            <button
+              onClick={() => {
+                setTool('calibration');
+                setDrawState(0);
+                setTempPoint(null);
+                setTempPolygon([]);
+                setTempCalibration([]);
+                setPreviewPoint(null);
+                setShowPolygon(true);
+              }}
+              disabled={!selectedId}
+              className={cn(
+                'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold transition-all border',
+                tool === 'calibration'
+                  ? 'bg-cyan-500/15 border-cyan-500 text-cyan-600'
+                  : 'border-border bg-background hover:bg-accent text-foreground',
+                !selectedId && 'opacity-40 cursor-not-allowed'
+              )}
+            >
+              <Hexagon className="h-4 w-4" />
+              Calibration Box (4pt)
             </button>
 
             <button

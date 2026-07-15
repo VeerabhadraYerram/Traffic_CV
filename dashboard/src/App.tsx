@@ -7,6 +7,7 @@ import { DashboardPage } from '@/pages/DashboardPage';
 import { TrackingPage } from '@/pages/TrackingPage';
 import { AnalyticsPage } from '@/pages/AnalyticsPage';
 import { ConfiguratorPage } from '@/pages/ConfiguratorPage';
+import { PipelinePage } from '@/pages/PipelinePage';
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
               <Route path="/" element={<RootLayout />}>
                 <Route index element={<Navigate to="/dashboard" replace />} />
                 <Route path="dashboard" element={<DashboardPage />} />
+                <Route path="pipeline" element={<PipelinePage />} />
                 <Route path="tracking" element={<TrackingPage />} />
                 <Route path="analytics" element={<AnalyticsPage />} />
                 <Route path="configurator" element={<ConfiguratorPage />} />

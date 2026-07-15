@@ -22,6 +22,11 @@ export function AppSidebar() {
       icon: LayoutDashboard,
     },
     {
+      name: 'Live Pipeline',
+      path: '/pipeline',
+      icon: Activity,
+    },
+    {
       name: 'Vehicle Tracking',
       path: '/tracking',
       icon: Map,
