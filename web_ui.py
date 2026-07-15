@@ -41,6 +41,7 @@ class ConfigPayload(BaseModel):
     entry_line: Optional[LineCoordinate] = None
     exit_line: Optional[LineCoordinate] = None
     speed_polygon: Optional[List[PointCoordinate]] = None
+    calibration_polygon: Optional[List[PointCoordinate]] = None
     distance_between_lines_meters: Optional[float] = None
 
 class AcknowledgePayload(BaseModel):
@@ -68,6 +69,7 @@ def get_cameras():
             "entry_line": c.entry_line_normalized,
             "exit_line": c.exit_line_normalized,
             "speed_polygon_normalized": c.speed_polygon_normalized,
+            "calibration_polygon_normalized": c.calibration_polygon_normalized,
             "distance_between_lines_meters": c.distance_between_lines_meters,
             
             # Dashboard expected fields
@@ -122,6 +124,8 @@ def save_lines(cam_id: str, payload: ConfigPayload):
         cam.exit_line_normalized = payload.exit_line.dict()
     if payload.speed_polygon is not None:
         cam.speed_polygon_normalized = [p.dict() for p in payload.speed_polygon]
+    if payload.calibration_polygon is not None:
+        cam.calibration_polygon_normalized = [p.dict() for p in payload.calibration_polygon]
     if payload.distance_between_lines_meters is not None:
         cam.distance_between_lines_meters = payload.distance_between_lines_meters
         

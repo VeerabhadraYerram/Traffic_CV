@@ -1,170 +1,222 @@
 import re
 
-def patch():
-    with open('run_cameras.py', 'r', encoding='utf-8') as f:
-        code = f.read()
+file_path = r"c:\Internship\Trafffic-Analytics\Traffic_CV\dashboard\src\pages\ConfiguratorPage.tsx"
+with open(file_path, "r", encoding="utf-8") as f:
+    content = f.read()
 
-    # 1. Threading -> Multiprocessing
-    code = code.replace('import threading', 'import multiprocessing')
-    code = code.replace('session_lock = threading.Lock()', '')
-    
-    # Remove global active_sessions init (lines 22-24)
-    code = re.sub(r'# Global memory for all cameras\n# Structure:.*?\nactive_sessions = \{\}\n', '', code, flags=re.DOTALL)
-    
-    # 2. flush_session_to_db: max_speed logic
-    speed_calc = """            speed_kmh = (15.0 / duration_sec) * 3.6 if duration_sec > 0 else 0.0
-            is_speeding = speed_kmh > speed_limit"""
-    new_speed_calc = """            max_inst_speed = session_data.get("max_speed_kmh", 0.0)
-            if max_inst_speed > 0:
-                speed_kmh = max_inst_speed
-            else:
-                line_dist = session_data.get("distance_between_lines_meters", 15.0)
-                speed_kmh = (line_dist / duration_sec) * 3.6 if duration_sec > 0 else 0.0
-            
-            is_speeding = speed_kmh > speed_limit"""
-    code = code.replace(speed_calc, new_speed_calc)
+# 1. Update Tool type
+content = content.replace(
+    "type Tool = 'entry' | 'exit' | 'polygon' | null;",
+    "type Tool = 'entry' | 'exit' | 'polygon' | 'calibration' | null;"
+)
 
-    # 3. process_camera signature
-    code = code.replace('def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm):',
-                        'def process_camera(cam_id, name, video_source, role, entry_line_norm, exit_line_norm, speed_polygon_normalized, distance_between_lines_meters):\n    from speed_estimator import SpeedEstimator\n    active_sessions = {}')
+# 2. Add state for calibration
+content = content.replace(
+    "const [speedPolygon, setSpeedPolygon] = useState<NormalizedPoint[]>([]);",
+    "const [speedPolygon, setSpeedPolygon] = useState<NormalizedPoint[]>([]);\n  const [calibrationPolygon, setCalibrationPolygon] = useState<NormalizedPoint[]>([]);"
+)
+content = content.replace(
+    "const [tempPolygon, setTempPolygon] = useState<NormalizedPoint[]>([]);",
+    "const [tempPolygon, setTempPolygon] = useState<NormalizedPoint[]>([]);\n  const [tempCalibration, setTempCalibration] = useState<NormalizedPoint[]>([]);"
+)
 
-    # 4. YOLO model init
-    old_yolo = """    # Initialize YOLO11 Model
-    model = YOLO("yolo11m.pt")"""
-    new_yolo = """    # Initialize YOLO11 Model
-    import os
-    if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
-        print(f"[{name}] ⚡ Loading TensorRT Engine: yolo11m.engine")
-        model = YOLO("yolo11m.engine", task="detect")
-    else:
-        print(f"[{name}] ℹ️ Loading standard PyTorch Model: yolo11m.pt")
-        model = YOLO("yolo11m.pt")"""
-    code = code.replace(old_yolo, new_yolo)
+# 3. Load calibration from camera
+content = content.replace(
+    "setSpeedPolygon(cam?.speed_polygon_normalized ?? []);",
+    "setSpeedPolygon(cam?.speed_polygon_normalized ?? []);\n    setCalibrationPolygon(cam?.calibration_polygon_normalized ?? []);"
+)
+content = content.replace(
+    "setTempPolygon([]);",
+    "setTempPolygon([]);\n    setTempCalibration([]);"
+)
 
-    # 5. Remove global init inside process_camera
-    old_init = """    # Init DB memory for this camera
-    with session_lock:
-        if cam_id not in active_sessions:
-            active_sessions[cam_id] = {}"""
-    code = code.replace(old_init, '')
+# 4. Update redraw signature and calls
+content = content.replace(
+    "redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, cam?.speed_polygon_normalized ?? [], null, null, [], null, showEntryExit, showPolygon);",
+    "redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, cam?.speed_polygon_normalized ?? [], cam?.calibration_polygon_normalized ?? [], null, null, [], [], null, showEntryExit, showPolygon);"
+)
 
-    # 6. speed estimator init
-    old_cap = """    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))"""
-    new_cap = """    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    speed_estimator = None
-    if speed_polygon_normalized:
-        speed_estimator = SpeedEstimator(
-            polygon_normalized=speed_polygon_normalized,
-            distance_meters=distance_between_lines_meters or 15.0,
-            frame_width=width,
-            frame_height=height
-        )"""
-    code = code.replace(old_cap, new_cap)
+# Replace the redraw definition
+old_redraw_def = """  const redraw = useCallback(
+    (
+      img: HTMLImageElement | null,
+      entry: NormalizedLine | null,
+      exit: NormalizedLine | null,
+      polygon: NormalizedPoint[],
+      preview: { x: number; y: number } | null,
+      anchor: { x: number; y: number } | null,
+      tPolygon: NormalizedPoint[],
+      activeTool?: Tool,
+      sEntryExit?: boolean,
+      sPolygon?: boolean
+    ) => {"""
+new_redraw_def = """  const redraw = useCallback(
+    (
+      img: HTMLImageElement | null,
+      entry: NormalizedLine | null,
+      exit: NormalizedLine | null,
+      polygon: NormalizedPoint[],
+      calibration: NormalizedPoint[],
+      preview: { x: number; y: number } | null,
+      anchor: { x: number; y: number } | null,
+      tPolygon: NormalizedPoint[],
+      tCalibration: NormalizedPoint[],
+      activeTool?: Tool,
+      sEntryExit?: boolean,
+      sPolygon?: boolean
+    ) => {"""
+content = content.replace(old_redraw_def, new_redraw_def)
 
-    # 7. Replace all active_sessions[cam_id] with active_sessions
-    code = code.replace('active_sessions[cam_id]', 'active_sessions')
-    
-    # 8. Remove with session_lock: and fix indentation. 
-    # A simple hack for Python is to replace 'with session_lock:' with 'if True:' so we don't have to re-indent everything!
-    code = code.replace('with session_lock:', 'if True:')
+# Update the useEffect for redraw
+content = content.replace(
+    "redraw(imageRef.current, entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon);",
+    "redraw(imageRef.current, entryLine, exitLine, speedPolygon, calibrationPolygon, previewPoint, tempPoint, tempPolygon, tempCalibration, tool, showEntryExit, showPolygon);"
+)
+content = content.replace(
+    "}, [entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon, redraw]);",
+    "}, [entryLine, exitLine, speedPolygon, calibrationPolygon, previewPoint, tempPoint, tempPolygon, tempCalibration, tool, showEntryExit, showPolygon, redraw]);"
+)
 
-    # 9. Update the loop where we process valid_tracks to calculate speed
-    old_valid_tracks = """        for tid, x1, y1, x2, y2, v_type in valid_tracks:
-            if tid not in active_sessions:"""
-    new_valid_tracks = """        for tid, x1, y1, x2, y2, v_type in valid_tracks:
-            inst_speed = 0.0
-            if speed_estimator:
-                cx = (x1 + x2) / 2
-                inst_speed = speed_estimator.update_and_get_speed(tid, (cx, y2))
-                
-            if tid not in active_sessions:"""
-    code = code.replace(old_valid_tracks, new_valid_tracks)
+# 5. Draw logic inside redraw
+# Find where drawPoly is defined
+draw_poly_def = """      // Speed Polygon
+      const drawPoly = (points: NormalizedPoint[], isComplete: boolean) => {"""
+new_draw_poly_def = """      // Generic Polygon Drawer
+      const drawPoly = (points: NormalizedPoint[], isComplete: boolean, colorStr: string, fillColorStr: string) => {"""
+content = content.replace(draw_poly_def, new_draw_poly_def)
 
-    # Update init of new sessions to store distance_between_lines_meters and max_speed
-    old_new_session = """                    active_sessions[tid] = {
-                        "plate_reads": [],
-                        "plate_confidences": [],
-                        "vehicle_type": v_type,
-                        "last_seen": frame_counter,
-                        "crossed_entry": False,
-                        "crossed_exit":  False,
-                        "entry_time":    None,
-                        "exit_time":     None,
-                    }"""
-    new_new_session = """                    active_sessions[tid] = {
-                        "plate_reads": [],
-                        "plate_confidences": [],
-                        "vehicle_type": v_type,
-                        "last_seen": frame_counter,
-                        "crossed_entry": False,
-                        "crossed_exit":  False,
-                        "entry_time":    None,
-                        "exit_time":     None,
-                        "max_speed_kmh": inst_speed,
-                        "distance_between_lines_meters": distance_between_lines_meters or 15.0
-                    }"""
-    code = code.replace(old_new_session, new_new_session)
+# Replace hardcoded colors in drawPoly
+content = content.replace("ctx.fillStyle = 'rgba(234, 179, 8, 0.2)'; // Yellow with opacity", "ctx.fillStyle = fillColorStr;")
+content = content.replace("ctx.strokeStyle = '#eab308';", "ctx.strokeStyle = colorStr;")
+content = content.replace("ctx.fillStyle = '#eab308';", "ctx.fillStyle = colorStr;")
 
-    # Update existing session max speed
-    old_update_session = """                    active_sessions[tid]["last_seen"] = frame_counter
-                    active_sessions[tid]["vehicle_type"] = v_type"""
-    new_update_session = """                    active_sessions[tid]["last_seen"] = frame_counter
-                    active_sessions[tid]["vehicle_type"] = v_type
-                    if inst_speed > active_sessions[tid].get("max_speed_kmh", 0):
-                        active_sessions[tid]["max_speed_kmh"] = inst_speed"""
-    code = code.replace(old_update_session, new_update_session)
-    
-    # 10. Clean stale trackers in speed estimator
-    old_flush = """        # DB flush happens outside the lock (it does I/O)
-        if stale_tids:
-            _db = SessionLocal()
-            cam_row = _db.query(Camera).filter(Camera.id == cam_id).first()
-            speed_limit_val = cam_row.speed_limit_kmh if cam_row else 30
-            _db.close()
-            for t in stale_tids:
-                if True:
-                    session_snap = dict(active_sessions.pop(t, {}))
-                flush_session_to_db(cam_id, t, session_snap, name, speed_limit_val)"""
-    new_flush = """        # DB flush happens outside the lock (it does I/O)
-        if stale_tids:
-            _db = SessionLocal()
-            cam_row = _db.query(Camera).filter(Camera.id == cam_id).first()
-            speed_limit_val = cam_row.speed_limit_kmh if cam_row else 30
-            _db.close()
-            for t in stale_tids:
-                if True:
-                    session_snap = dict(active_sessions.pop(t, {}))
-                flush_session_to_db(cam_id, t, session_snap, name, speed_limit_val)
-            if speed_estimator:
-                speed_estimator.clean_stale_trackers(active_sessions.keys())"""
-    code = code.replace(old_flush, new_flush)
+# Update drawPoly calls
+content = content.replace("drawPoly(polygon, true);", "drawPoly(polygon, true, '#eab308', 'rgba(234, 179, 8, 0.2)');")
+content = content.replace("drawPoly(tPolygon, false);", "drawPoly(tPolygon, false, '#eab308', 'rgba(234, 179, 8, 0.2)');")
 
-    # 11. Main Threading to Multiprocessing
-    old_thread_start = """        t = multiprocessing.Thread(
-            target=process_camera,
-            args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized)
-        )
-        t.start()
-        threads.append(t)"""
-    new_thread_start = """        t = multiprocessing.Process(
-            target=process_camera,
-            args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized, cam.speed_polygon_normalized, cam.distance_between_lines_meters)
-        )
-        t.start()
-        threads.append(t)"""
-    code = code.replace(old_thread_start, new_thread_start)
-    
-    # Oh wait, we replaced 'import threading' with 'import multiprocessing', so 'threading.Thread' became 'multiprocessing.Thread'!
-    # Let's fix that fallback explicitly in case the string is different.
-    code = code.replace('multiprocessing.Thread(', 'multiprocessing.Process(')
-    code = code.replace('args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized)', 
-                        'args=(cam_id, cam.name, cam.video_source, role, cam.entry_line_normalized, cam.exit_line_normalized, cam.speed_polygon_normalized, cam.distance_between_lines_meters)')
+# Also fix the `if (sPolygon && polygon.length === 4)` to `polygon.length >= 3`
+content = content.replace("if (sPolygon && polygon.length === 4) {", "if (sPolygon && polygon.length >= 3) {")
 
-    with open('run_cameras.py', 'w', encoding='utf-8') as f:
-        f.write(code)
+# Add drawing for calibration polygon
+calibration_draw_code = """
+      if (sPolygon && calibration.length === 4) {
+         drawPoly(calibration, true, '#06b6d4', 'rgba(6, 182, 212, 0.2)'); // Cyan
+      }
 
-if __name__ == '__main__':
-    patch()
+      if (activeTool === 'calibration' && tCalibration.length > 0) {
+         drawPoly(tCalibration, false, '#06b6d4', 'rgba(6, 182, 212, 0.2)');
+         if (preview) {
+             ctx.beginPath();
+             const last = tCalibration[tCalibration.length - 1];
+             ctx.moveTo(last.x * canvas.width, last.y * canvas.height);
+             ctx.lineTo(preview.x * canvas.width, preview.y * canvas.height);
+             ctx.strokeStyle = '#06b6d4';
+             ctx.setLineDash([8,4]);
+             ctx.stroke();
+             ctx.setLineDash([]);
+         }
+      }
+"""
+content = content.replace("      // Lines", calibration_draw_code + "\n      // Lines")
+
+# 6. Mouse down logic
+old_mouse_down = """    if (tool === 'polygon') {
+      const newPoly = [...tempPolygon, { x: normX, y: normY }];
+      if (newPoly.length === 4) {
+          setSpeedPolygon(newPoly);
+          setTempPolygon([]);
+          setTool(null);
+          setPreviewPoint(null);
+      } else {
+          setTempPolygon(newPoly);
+      }
+      return;
+    }"""
+new_mouse_down = """    if (tool === 'polygon') {
+      setTempPolygon([...tempPolygon, { x: normX, y: normY }]);
+      return;
+    }
+
+    if (tool === 'calibration') {
+      const newCal = [...tempCalibration, { x: normX, y: normY }];
+      if (newCal.length === 4) {
+          setCalibrationPolygon(newCal);
+          setTempCalibration([]);
+          setTool(null);
+          setPreviewPoint(null);
+      } else {
+          setTempCalibration(newCal);
+      }
+      return;
+    }"""
+content = content.replace(old_mouse_down, new_mouse_down)
+
+# Mouse move logic
+content = content.replace("if (tool === 'polygon' && tempPolygon.length === 0) return;", "if (tool === 'polygon' && tempPolygon.length === 0) return;\n    if (tool === 'calibration' && tempCalibration.length === 0) return;")
+
+# 7. Save logic
+old_save = """        speed_polygon: speedPolygon.length === 4 ? speedPolygon : null,
+        distance_between_lines_meters: distance"""
+new_save = """        speed_polygon: speedPolygon.length >= 3 ? speedPolygon : null,
+        calibration_polygon: calibrationPolygon.length === 4 ? calibrationPolygon : null,
+        distance_between_lines_meters: distance"""
+content = content.replace(old_save, new_save)
+
+# 8. Reset logic
+content = content.replace("setSpeedPolygon([]);", "setSpeedPolygon([]);\n    setCalibrationPolygon([]);")
+content = content.replace("setTempPolygon([]);", "setTempPolygon([]);\n    setTempCalibration([]);")
+
+# 9. UI Buttons - Add finish polygon button and calibration button
+old_buttons = """                  <Button
+                    variant={tool === 'polygon' ? 'default' : 'outline'}
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => { setTool('polygon'); setTempPolygon([]); setDrawState(0); }}
+                  >
+                    <Hexagon className="mr-2 h-4 w-4" />
+                    Speed Polygon
+                  </Button>"""
+
+new_buttons = """                  <Button
+                    variant={tool === 'polygon' ? 'default' : 'outline'}
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => { setTool('polygon'); setTempPolygon([]); setDrawState(0); }}
+                  >
+                    <Hexagon className="mr-2 h-4 w-4" />
+                    Speed ROI Polygon
+                  </Button>
+                  
+                  {tool === 'polygon' && tempPolygon.length >= 3 && (
+                     <Button
+                       variant="default"
+                       size="sm"
+                       className="w-full justify-start bg-green-600 hover:bg-green-700"
+                       onClick={() => { 
+                         setSpeedPolygon(tempPolygon);
+                         setTempPolygon([]);
+                         setTool(null);
+                         setPreviewPoint(null);
+                       }}
+                     >
+                       <Save className="mr-2 h-4 w-4" />
+                       Finish ROI Polygon
+                     </Button>
+                  )}
+
+                  <Button
+                    variant={tool === 'calibration' ? 'default' : 'outline'}
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => { setTool('calibration'); setTempCalibration([]); setDrawState(0); }}
+                  >
+                    <Hexagon className="mr-2 h-4 w-4" />
+                    Calibration Box (4pt)
+                  </Button>"""
+
+content = content.replace(old_buttons, new_buttons)
+
+with open(file_path, "w", encoding="utf-8") as f:
+    f.write(content)
+
+print("ConfiguratorPage.tsx patched successfully!")
