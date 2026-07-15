@@ -1,14 +1,15 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import type { ChangeEvent } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { SlidersHorizontal, Pencil, Minus, RotateCcw, Save, Info } from 'lucide-react';
+import { SlidersHorizontal, Pencil, Minus, RotateCcw, Save, Info, Hexagon, Upload, Eye, EyeOff } from 'lucide-react';
 import { dataService } from '@/lib/state-store';
-import type { ConfiguratorCamera, NormalizedLine } from '@/types';
+import type { ConfiguratorCamera, NormalizedLine, NormalizedPoint } from '@/types';
 import { cn } from '@/lib/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Tool = 'entry' | 'exit' | null;
+type Tool = 'entry' | 'exit' | 'polygon' | null;
 type DrawState = 0 | 1; // 0 = idle, 1 = first point placed
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -106,16 +107,32 @@ function drawPreviewLine(
 export function ConfiguratorPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const queryClient = useQueryClient();
 
   const [selectedId, setSelectedId] = useState<string>('');
+  
+  // Configurations
   const [entryLine, setEntryLine] = useState<NormalizedLine | null>(null);
   const [exitLine, setExitLine] = useState<NormalizedLine | null>(null);
+  const [speedPolygon, setSpeedPolygon] = useState<NormalizedPoint[]>([]);
+  const [distance, setDistance] = useState<number>(15.0);
+
+  // View Options
+  const [showEntryExit, setShowEntryExit] = useState(true);
+  const [showPolygon, setShowPolygon] = useState(true);
+
+  // Tools & State
   const [tool, setTool] = useState<Tool>(null);
   const [drawState, setDrawState] = useState<DrawState>(0);
   const [tempPoint, setTempPoint] = useState<{ x: number; y: number } | null>(null);
+  const [tempPolygon, setTempPolygon] = useState<NormalizedPoint[]>([]);
   const [previewPoint, setPreviewPoint] = useState<{ x: number; y: number } | null>(null);
+  
   const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [frameError, setFrameError] = useState(false);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
 
   // ── Fetch cameras ─────────────────────────────────────────────────────────
   const { data: cameras = [], isLoading } = useQuery({
@@ -133,10 +150,14 @@ export function ConfiguratorPage() {
     const cam = cameras.find((c) => c.id === selectedId);
     setEntryLine(cam?.entry_line ?? null);
     setExitLine(cam?.exit_line ?? null);
+    setSpeedPolygon(cam?.speed_polygon_normalized ?? []);
+    setDistance(cam?.distance_between_lines_meters ?? 15.0);
+    
     setTool(null);
     setDrawState(0);
     setTempPoint(null);
     setPreviewPoint(null);
+    setTempPolygon([]);
     setFrameError(false);
 
     const img = new Image();
@@ -146,12 +167,12 @@ export function ConfiguratorPage() {
       if (!canvas) return;
       canvas.width = img.width;
       canvas.height = img.height;
-      redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, null, null);
+      redraw(img, cam?.entry_line ?? null, cam?.exit_line ?? null, cam?.speed_polygon_normalized ?? [], null, null, [], null, showEntryExit, showPolygon);
     };
     img.onerror = () => setFrameError(true);
     img.src = `/api/cameras/${selectedId}/frame?t=${Date.now()}`;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedId]);
+  }, [selectedId, refreshTrigger]);
 
   // ── Redraw canvas ─────────────────────────────────────────────────────────
   const redraw = useCallback(
@@ -159,9 +180,13 @@ export function ConfiguratorPage() {
       img: HTMLImageElement | null,
       entry: NormalizedLine | null,
       exit: NormalizedLine | null,
+      polygon: NormalizedPoint[],
       preview: { x: number; y: number } | null,
       anchor: { x: number; y: number } | null,
-      activeTool?: Tool
+      tPolygon: NormalizedPoint[],
+      activeTool?: Tool,
+      sEntryExit?: boolean,
+      sPolygon?: boolean
     ) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -172,7 +197,55 @@ export function ConfiguratorPage() {
 
       if (img) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-      if (entry) {
+      // Speed Polygon
+      const drawPoly = (points: NormalizedPoint[], isComplete: boolean) => {
+         if (points.length === 0) return;
+         ctx.beginPath();
+         ctx.moveTo(points[0].x * canvas.width, points[0].y * canvas.height);
+         for(let i = 1; i < points.length; i++) {
+             ctx.lineTo(points[i].x * canvas.width, points[i].y * canvas.height);
+         }
+         
+         if (isComplete) {
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(234, 179, 8, 0.2)'; // Yellow with opacity
+            ctx.fill();
+         }
+         
+         ctx.strokeStyle = '#eab308';
+         ctx.lineWidth = 2;
+         ctx.stroke();
+
+         for (const p of points) {
+            ctx.beginPath();
+            ctx.arc(p.x * canvas.width, p.y * canvas.height, 5, 0, Math.PI * 2);
+            ctx.fillStyle = '#eab308';
+            ctx.fill();
+            ctx.strokeStyle = 'white';
+            ctx.stroke();
+         }
+      };
+
+      if (sPolygon && polygon.length === 4) {
+         drawPoly(polygon, true);
+      }
+
+      if (activeTool === 'polygon' && tPolygon.length > 0) {
+         drawPoly(tPolygon, false);
+         if (preview) {
+             ctx.beginPath();
+             const last = tPolygon[tPolygon.length - 1];
+             ctx.moveTo(last.x * canvas.width, last.y * canvas.height);
+             ctx.lineTo(preview.x * canvas.width, preview.y * canvas.height);
+             ctx.strokeStyle = '#eab308';
+             ctx.setLineDash([8,4]);
+             ctx.stroke();
+             ctx.setLineDash([]);
+         }
+      }
+
+      // Lines
+      if (sEntryExit && entry) {
         drawLine(
           ctx,
           entry.x1 * canvas.width, entry.y1 * canvas.height,
@@ -181,7 +254,7 @@ export function ConfiguratorPage() {
         );
       }
 
-      if (exit) {
+      if (sEntryExit && exit) {
         drawLine(
           ctx,
           exit.x1 * canvas.width, exit.y1 * canvas.height,
@@ -190,8 +263,8 @@ export function ConfiguratorPage() {
         );
       }
 
-      // preview rubber-band
-      if (anchor && preview && activeTool) {
+      // preview rubber-band for lines
+      if (anchor && preview && (activeTool === 'entry' || activeTool === 'exit')) {
         const color = activeTool === 'entry' ? '#22c55e' : '#ef4444';
         drawPreviewLine(
           ctx,
@@ -206,13 +279,26 @@ export function ConfiguratorPage() {
 
   // trigger redraw whenever lines change
   useEffect(() => {
-    redraw(imageRef.current, entryLine, exitLine, previewPoint, tempPoint, tool);
-  }, [entryLine, exitLine, previewPoint, tempPoint, tool, redraw]);
+    redraw(imageRef.current, entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon);
+  }, [entryLine, exitLine, speedPolygon, previewPoint, tempPoint, tempPolygon, tool, showEntryExit, showPolygon, redraw]);
 
   // ── Canvas events ─────────────────────────────────────────────────────────
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!tool || !canvasRef.current) return;
     const { normX, normY } = getCanvasCoords(e, canvasRef.current);
+
+    if (tool === 'polygon') {
+      const newPoly = [...tempPolygon, { x: normX, y: normY }];
+      if (newPoly.length === 4) {
+          setSpeedPolygon(newPoly);
+          setTempPolygon([]);
+          setTool(null);
+          setPreviewPoint(null);
+      } else {
+          setTempPolygon(newPoly);
+      }
+      return;
+    }
 
     if (drawState === 0) {
       setTempPoint({ x: normX, y: normY });
@@ -232,9 +318,31 @@ export function ConfiguratorPage() {
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (drawState !== 1 || !canvasRef.current) return;
+    if (!tool || !canvasRef.current) return;
+    if (tool === 'polygon' && tempPolygon.length === 0) return;
+    if ((tool === 'entry' || tool === 'exit') && drawState !== 1) return;
+    
     const { normX, normY } = getCanvasCoords(e, canvasRef.current);
     setPreviewPoint({ x: normX, y: normY });
+  };
+
+  // ── Video Upload ─────────────────────────────────────────────────────────
+  const handleFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0 || !selectedId) return;
+    const file = e.target.files[0];
+    
+    setUploading(true);
+    try {
+      await dataService.uploadVideo(selectedId, file);
+      toast.success('Video uploaded successfully', { description: 'The video source for this camera has been updated.' });
+      queryClient.invalidateQueries({ queryKey: ['cameras'] });
+      setRefreshTrigger(prev => prev + 1); // trigger frame reload
+    } catch (err) {
+      toast.error('Upload failed', { description: String(err) });
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   };
 
   // ── Save ─────────────────────────────────────────────────────────────────
@@ -245,9 +353,11 @@ export function ConfiguratorPage() {
       await dataService.saveCameraLines(selectedId, {
         entry_line: entryLine,
         exit_line: exitLine,
+        speed_polygon: speedPolygon.length === 4 ? speedPolygon : null,
+        distance_between_lines_meters: distance
       });
       toast.success('Configuration saved', {
-        description: `Tripwire lines updated for "${selectedCamera?.name}"`,
+        description: `Tripwire and speed configurations updated for "${selectedCamera?.name}"`,
       });
     } catch (err) {
       toast.error('Save failed', { description: String(err) });
@@ -260,9 +370,11 @@ export function ConfiguratorPage() {
   const handleReset = () => {
     setEntryLine(null);
     setExitLine(null);
+    setSpeedPolygon([]);
     setTool(null);
     setDrawState(0);
     setTempPoint(null);
+    setTempPolygon([]);
     setPreviewPoint(null);
   };
 
@@ -279,16 +391,16 @@ export function ConfiguratorPage() {
         <div>
           <h1 className="text-xl font-bold tracking-tight">Camera Configurator</h1>
           <p className="text-sm text-muted-foreground">
-            Draw entry and exit tripwire lines on the camera frame
+            Draw tracking zones and configure video feeds
           </p>
         </div>
       </div>
 
-      <div className="flex gap-4 flex-1 min-h-0">
+      <div className="flex gap-4 flex-1 min-h-0 overflow-y-auto">
         {/* ── Sidebar Panel ── */}
-        <div className="w-72 shrink-0 flex flex-col gap-4">
+        <div className="w-80 shrink-0 flex flex-col gap-4">
 
-          {/* Camera selector */}
+          {/* Camera selector & Upload */}
           <div className="rounded-lg border bg-card p-4 flex flex-col gap-3">
             <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
               Select Camera
@@ -312,40 +424,62 @@ export function ConfiguratorPage() {
 
             {/* Camera meta */}
             {selectedCamera && (
-              <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1 text-muted-foreground">
-                <div className="flex justify-between">
-                  <span>Role</span>
-                  <span className="font-mono font-semibold text-foreground capitalize">
-                    {selectedCamera.role}
+              <div className="rounded-md bg-muted/50 p-3 text-xs space-y-2 text-muted-foreground">
+                <div className="flex justify-between items-center">
+                  <span>Source File</span>
+                  <span className="font-mono text-[10px] text-foreground truncate max-w-[150px]" title={selectedCamera.video_source}>
+                    {selectedCamera.video_source.split('/').pop()}
                   </span>
                 </div>
-                <div className="flex justify-between">
-                  <span>IP</span>
-                  <span className="font-mono text-foreground">
-                    {selectedCamera.ip_address ?? '—'}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Speed Limit</span>
-                  <span className="font-mono text-foreground">
-                    {selectedCamera.speed_limit_kmh} km/h
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Status</span>
-                  <span
-                    className={cn(
-                      'font-semibold',
-                      selectedCamera.status === 'ACTIVE'
-                        ? 'text-emerald-600'
-                        : 'text-destructive'
-                    )}
+                
+                <div className="pt-2 border-t border-border">
+                  <input type="file" accept="video/mp4,video/x-m4v,video/*" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
+                  <button 
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploading}
+                    className="w-full flex items-center justify-center gap-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80 px-2 py-1.5 text-xs font-medium transition-colors"
                   >
-                    {selectedCamera.status}
-                  </span>
+                    <Upload className="h-3.5 w-3.5" />
+                    {uploading ? 'Uploading...' : 'Upload New Video'}
+                  </button>
                 </div>
               </div>
             )}
+          </div>
+
+          {/* Configuration Inputs */}
+          <div className="rounded-lg border bg-card p-4 flex flex-col gap-3">
+            <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Speed Configuration
+            </label>
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Real-world distance between lines (Meters)</label>
+              <input 
+                type="number" 
+                value={distance} 
+                onChange={e => setDistance(parseFloat(e.target.value) || 0)}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                step="0.5"
+                min="1"
+              />
+            </div>
+            
+            <div className="flex items-center gap-2 pt-2">
+               <button 
+                  onClick={() => setShowEntryExit(!showEntryExit)} 
+                  className={cn("flex-1 flex items-center justify-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium border transition-colors", showEntryExit ? "border-primary text-primary bg-primary/10" : "border-border text-muted-foreground")}
+               >
+                 {showEntryExit ? <Eye className="h-3 w-3"/> : <EyeOff className="h-3 w-3"/>}
+                 Entry/Exit
+               </button>
+               <button 
+                  onClick={() => setShowPolygon(!showPolygon)} 
+                  className={cn("flex-1 flex items-center justify-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium border transition-colors", showPolygon ? "border-yellow-500 text-yellow-600 bg-yellow-500/10" : "border-border text-muted-foreground")}
+               >
+                 {showPolygon ? <Eye className="h-3 w-3"/> : <EyeOff className="h-3 w-3"/>}
+                 Speed Poly
+               </button>
+            </div>
           </div>
 
           {/* Drawing tools */}
@@ -359,11 +493,13 @@ export function ConfiguratorPage() {
                 setTool('entry');
                 setDrawState(0);
                 setTempPoint(null);
+                setTempPolygon([]);
                 setPreviewPoint(null);
+                setShowEntryExit(true);
               }}
               disabled={!selectedId}
               className={cn(
-                'flex items-center gap-2 rounded-md px-3 py-2.5 text-sm font-semibold transition-all border',
+                'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold transition-all border',
                 tool === 'entry'
                   ? 'bg-emerald-500/15 border-emerald-500 text-emerald-600'
                   : 'border-border bg-background hover:bg-accent text-foreground',
@@ -379,11 +515,13 @@ export function ConfiguratorPage() {
                 setTool('exit');
                 setDrawState(0);
                 setTempPoint(null);
+                setTempPolygon([]);
                 setPreviewPoint(null);
+                setShowEntryExit(true);
               }}
               disabled={!selectedId}
               className={cn(
-                'flex items-center gap-2 rounded-md px-3 py-2.5 text-sm font-semibold transition-all border',
+                'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold transition-all border',
                 tool === 'exit'
                   ? 'bg-red-500/15 border-red-500 text-red-600'
                   : 'border-border bg-background hover:bg-accent text-foreground',
@@ -395,15 +533,37 @@ export function ConfiguratorPage() {
             </button>
 
             <button
+              onClick={() => {
+                setTool('polygon');
+                setDrawState(0);
+                setTempPoint(null);
+                setTempPolygon([]);
+                setPreviewPoint(null);
+                setShowPolygon(true);
+              }}
+              disabled={!selectedId}
+              className={cn(
+                'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold transition-all border',
+                tool === 'polygon'
+                  ? 'bg-yellow-500/15 border-yellow-500 text-yellow-600'
+                  : 'border-border bg-background hover:bg-accent text-foreground',
+                !selectedId && 'opacity-40 cursor-not-allowed'
+              )}
+            >
+              <Hexagon className="h-4 w-4" />
+              Draw Speed Polygon
+            </button>
+
+            <button
               onClick={handleReset}
               disabled={!selectedId}
               className={cn(
-                'flex items-center gap-2 rounded-md px-3 py-2.5 text-sm font-medium transition-all border border-border bg-background hover:bg-accent text-muted-foreground',
+                'flex items-center gap-2 rounded-md px-3 py-2 mt-2 text-sm font-medium transition-all border border-border bg-background hover:bg-accent text-muted-foreground',
                 !selectedId && 'opacity-40 cursor-not-allowed'
               )}
             >
               <RotateCcw className="h-4 w-4" />
-              Clear All Lines
+              Clear All Overlays
             </button>
           </div>
 
@@ -411,7 +571,7 @@ export function ConfiguratorPage() {
           <div className="rounded-lg border bg-card p-4 flex flex-col gap-2 text-xs text-muted-foreground">
             <div className="flex items-center gap-1.5 font-semibold text-foreground text-[11px] uppercase tracking-wider">
               <Info className="h-3.5 w-3.5" />
-              Line Status
+              Overlay Status
             </div>
             <div className="flex justify-between">
               <span>Entry Line</span>
@@ -425,12 +585,20 @@ export function ConfiguratorPage() {
                 {exitLine ? '✓ Set' : 'Not set'}
               </span>
             </div>
+            <div className="flex justify-between">
+              <span>Speed Polygon</span>
+              <span className={speedPolygon.length === 4 ? 'text-yellow-600 font-semibold' : 'text-muted-foreground'}>
+                {speedPolygon.length === 4 ? '✓ Set' : 'Not set'}
+              </span>
+            </div>
 
             {tool && (
               <div className="mt-1 rounded-md bg-primary/10 text-primary px-2 py-1.5 text-[11px] font-medium leading-snug">
-                {drawState === 0
-                  ? `Click on the frame to set the start point of the ${tool} line`
-                  : `Click again to complete the ${tool} line`}
+                {tool === 'polygon' 
+                  ? `Click to place point ${tempPolygon.length + 1} of 4 for the polygon`
+                  : drawState === 0
+                    ? `Click on the frame to set the start point of the ${tool} line`
+                    : `Click again to complete the ${tool} line`}
               </div>
             )}
           </div>
@@ -451,7 +619,7 @@ export function ConfiguratorPage() {
         </div>
 
         {/* ── Canvas Panel ── */}
-        <div className="flex-1 rounded-lg border bg-black overflow-hidden flex items-center justify-center relative">
+        <div className="flex-1 rounded-lg border bg-black overflow-hidden flex items-center justify-center relative min-h-[500px]">
           {!selectedId && (
             <div className="text-center text-muted-foreground space-y-2">
               <SlidersHorizontal className="h-12 w-12 mx-auto opacity-20" />
@@ -460,12 +628,12 @@ export function ConfiguratorPage() {
           )}
 
           {selectedId && frameError && (
-            <div className="text-center text-muted-foreground space-y-2">
+            <div className="text-center text-muted-foreground space-y-2 z-10 absolute inset-0 flex flex-col justify-center items-center bg-black/80">
               <p className="text-sm font-medium text-destructive">
                 Could not load camera frame
               </p>
               <p className="text-xs">
-                Check that the video source is accessible
+                Check that the video source is accessible or upload a new video.
               </p>
             </div>
           )}

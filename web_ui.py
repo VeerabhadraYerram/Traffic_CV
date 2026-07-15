@@ -1,11 +1,12 @@
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import cv2
 import os
-from typing import Optional
+import shutil
+from typing import Optional, List
 
 from database import SessionLocal, init_db
 from models import Camera, PremiseAccessLog, Violation
@@ -32,9 +33,15 @@ class LineCoordinate(BaseModel):
     x2: float
     y2: float
 
-class LinesPayload(BaseModel):
+class PointCoordinate(BaseModel):
+    x: float
+    y: float
+
+class ConfigPayload(BaseModel):
     entry_line: Optional[LineCoordinate] = None
     exit_line: Optional[LineCoordinate] = None
+    speed_polygon: Optional[List[PointCoordinate]] = None
+    distance_between_lines_meters: Optional[float] = None
 
 class AcknowledgePayload(BaseModel):
     status: str
@@ -60,6 +67,8 @@ def get_cameras():
             "video_source": c.video_source,
             "entry_line": c.entry_line_normalized,
             "exit_line": c.exit_line_normalized,
+            "speed_polygon_normalized": c.speed_polygon_normalized,
+            "distance_between_lines_meters": c.distance_between_lines_meters,
             
             # Dashboard expected fields
             "camera_id": str(c.id),
@@ -99,7 +108,7 @@ def get_camera_frame(cam_id: str):
     return Response(content=buffer.tobytes(), media_type="image/jpeg")
 
 @app.post("/api/cameras/{cam_id}/lines")
-def save_lines(cam_id: str, payload: LinesPayload):
+def save_lines(cam_id: str, payload: ConfigPayload):
     db = SessionLocal()
     cam = db.query(Camera).filter(Camera.id == cam_id).first()
     
@@ -107,15 +116,48 @@ def save_lines(cam_id: str, payload: LinesPayload):
         db.close()
         raise HTTPException(status_code=404, detail="Camera not found")
         
-    if payload.entry_line:
+    if payload.entry_line is not None:
         cam.entry_line_normalized = payload.entry_line.dict()
-    if payload.exit_line:
+    if payload.exit_line is not None:
         cam.exit_line_normalized = payload.exit_line.dict()
+    if payload.speed_polygon is not None:
+        cam.speed_polygon_normalized = [p.dict() for p in payload.speed_polygon]
+    if payload.distance_between_lines_meters is not None:
+        cam.distance_between_lines_meters = payload.distance_between_lines_meters
         
     db.commit()
     db.close()
     
-    return {"status": "success", "message": "Lines updated successfully"}
+    return {"status": "success", "message": "Configuration updated successfully"}
+
+@app.post("/api/cameras/{cam_id}/video")
+def upload_video(cam_id: str, file: UploadFile = File(...)):
+    import traceback
+    try:
+        db = SessionLocal()
+        cam = db.query(Camera).filter(Camera.id == cam_id).first()
+        
+        if not cam:
+            db.close()
+            raise HTTPException(status_code=404, detail="Camera not found")
+            
+        os.makedirs("downloads", exist_ok=True)
+        file_path = os.path.join("downloads", file.filename)
+        
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        video_source_path = f"/app/{file_path.replace(os.sep, '/')}"
+        cam.video_source = video_source_path
+        db.commit()
+        db.close()
+        
+    except Exception as e:
+        db.rollback()
+        db.close()
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}\n{traceback.format_exc()}")
+    
+    return {"status": "success", "message": "Video uploaded successfully", "video_source": video_source_path}
 
 @app.get("/api/events")
 def get_events():

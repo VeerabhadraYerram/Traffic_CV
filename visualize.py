@@ -113,6 +113,16 @@ def main():
             end=sv.Point(x=int(cam.exit_line_normalized["x2"] * width), y=int(cam.exit_line_normalized["y2"] * height))
         )
         
+    from speed_estimator import SpeedEstimator
+    speed_estimator = None
+    if cam.speed_polygon_normalized:
+        speed_estimator = SpeedEstimator(
+            polygon_normalized=cam.speed_polygon_normalized,
+            distance_meters=cam.distance_between_lines_meters or 15.0,
+            frame_width=width,
+            frame_height=height
+        )
+        
     # Setup Annotators
     box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.TRACK)
     label_annotator = sv.LabelAnnotator(text_thickness=2, text_scale=1, text_position=sv.Position.TOP_CENTER, color_lookup=sv.ColorLookup.TRACK)
@@ -184,11 +194,19 @@ def main():
                                 if 4 <= len(cleaned) <= 12:
                                     active_sessions[tid]["plate_reads"].append(cleaned)
             
+            inst_speed = 0.0
+            if speed_estimator:
+                cx = (x1 + x2) / 2
+                inst_speed = speed_estimator.update_and_get_speed(tid, (cx, y2))
+                
             current_plate = get_mode(active_sessions[tid]["plate_reads"])
-            if current_plate == "UNKNOWN":
-                labels.append(f"#{tid}")
-            else:
-                labels.append(f"#{tid} {current_plate}")
+            label_text = f"#{tid}"
+            if current_plate != "UNKNOWN":
+                label_text += f" {current_plate}"
+            if inst_speed > 0:
+                label_text += f" {inst_speed:.1f}km/h"
+                
+            labels.append(label_text)
                 
         # 3. Trigger Virtual Lines and Annotate
         if len(xyxys) > 0:
@@ -212,6 +230,14 @@ def main():
             frame = entry_line_annotator.annotate(frame=frame, line_counter=entry_line)
         if exit_line:
             frame = exit_line_annotator.annotate(frame=frame, line_counter=exit_line)
+            
+        # Annotate Speed Polygon
+        if cam.speed_polygon_normalized:
+            pts = []
+            for p in cam.speed_polygon_normalized:
+                pts.append([int(p["x"] * width), int(p["y"] * height)])
+            pts = np.array(pts, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
 
         # 4. Save Frame
         out.write(frame)
