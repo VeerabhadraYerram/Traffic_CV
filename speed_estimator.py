@@ -13,6 +13,7 @@ class SpeedEstimator:
         distance_meters: Physical length of the polygon (top to bottom).
         """
         self.distance_meters = distance_meters
+        self.lane_width_meters = 3.5
         self.frame_width = frame_width
         self.frame_height = frame_height
         
@@ -43,8 +44,8 @@ class SpeedEstimator:
         scale = 10.0
         projected_height = self.distance_meters * scale
         
-        # Arbitrary width just to form a rectangle, as long as it aligns with the perspective depth
-        projected_width = projected_height
+        # Use standard lane width instead of assuming the box is a square
+        projected_width = self.lane_width_meters * scale
         
         dst_points = np.array([
             [0, 0],
@@ -54,6 +55,7 @@ class SpeedEstimator:
         ], dtype=np.float32)
         
         M, _ = cv2.findHomography(self.src_points, dst_points)
+        print(f"[DEBUG] _calculate_homography: M={M}")
         return M
 
     def update_and_get_speed(self, tracker_id, bottom_center, current_time=None):
@@ -61,6 +63,7 @@ class SpeedEstimator:
         Updates the history for a tracker_id and returns the smoothed instantaneous speed in km/h.
         """
         if self.homography_matrix is None:
+            print(f"[DEBUG] homography_matrix is None!")
             return 0.0
             
         if current_time is None:
@@ -85,19 +88,25 @@ class SpeedEstimator:
         if len(history) < 5:  # Need at least 5 frames of history to calculate a stable speed
             return 0.0
             
-        oldest_time, old_x, old_y = history[0]
-        newest_time, new_x, new_y = history[-1]
+        oldest_time, _, _ = history[0]
+        newest_time, _, _ = history[-1]
         
         dt = newest_time - oldest_time
         if dt <= 0.01:
+            print(f"[DEBUG] dt <= 0.01: {dt}")
             return 0.0
             
-        dx = new_x - old_x
-        dy = new_y - old_y
-        distance = np.sqrt(dx**2 + dy**2)
+        # Calculate cumulative displacement along the curved path
+        distance = 0.0
+        for i in range(1, len(history)):
+            _, px, py = history[i-1]
+            _, cx, cy = history[i]
+            distance += np.sqrt((cx - px)**2 + (cy - py)**2)
         
         speed_mps = distance / dt
         speed_kmh = speed_mps * 3.6
+        if speed_kmh == 0.0:
+            print(f"[DEBUG] speed is exactly 0.0. distance: {distance}, len(history): {len(history)}, coords: {history[-2]} -> {history[-1]}")
         return speed_kmh
 
     def clean_stale_trackers(self, active_tracker_ids):
