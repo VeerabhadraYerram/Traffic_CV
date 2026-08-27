@@ -1,13 +1,24 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
+# Force low-latency TCP transport and zero-buffering for OpenCV RTSP / Network Streams
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|"
+    "fflags;nobuffer|"
+    "flags;low_delay|"
+    "max_delay;500000|"
+    "reorder_queue_size;0|"
+    "stimeout;5000000|"
+    "buffer_size;1024000"
+)
 import cv2
 import time
 import numpy as np
 import threading
+import queue
 from datetime import datetime, timezone
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import supervision as sv
@@ -18,7 +29,7 @@ from paddleocr import PaddleOCR
 from database import SessionLocal
 from models import Camera, CameraRole
 from speed_estimator import SpeedEstimator
-from utils import YOLO_CLASS_MAP, correct_indian_plate, enhance_plate, flush_session_to_db
+from utils import YOLO_CLASS_MAP, clean_plate, enhance_plate, flush_session_to_db
 
 app = FastAPI()
 
@@ -30,24 +41,325 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("⚡ Loading Global ML Models...")
-if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
-    model = YOLO("yolo11m.engine", task="detect")
-else:
-    model = YOLO("yolo11m.pt")
-
-try:
-    lp_model = YOLO("models/yolov8n_license_plate.pt")
-except:
-    lp_model = None
-
 device_is_gpu = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-reader = PaddleOCR(use_angle_cls=True, lang='en')
+
+# Globals
+model = None
+lp_model = None
+reader = None
+models_loaded = False
+models_lock = threading.Lock()
+
+def load_models_background():
+    global model, lp_model, reader, models_loaded
+    with models_lock:
+        if models_loaded:
+            return
+            
+        while not models_loaded:
+            try:
+                print("⚡ Loading Global ML Models in background...")
+                if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
+                    model = YOLO("yolo11m.engine", task="detect")
+                else:
+                    model = YOLO("yolo11m.pt")
+
+                try:
+                    lp_model = YOLO("models/yolov8n_license_plate.pt")
+                except:
+                    lp_model = None
+
+                reader = PaddleOCR(use_angle_cls=True, lang='en')
+                models_loaded = True
+                print("✅ ML Models fully loaded!")
+            except Exception as e:
+                print(f"❌ Error loading models: {e}. Cleaning up and retrying in 5 seconds...")
+                import shutil
+                import time
+                shutil.rmtree('/root/.paddleocr', ignore_errors=True)
+                time.sleep(5)
+
+# Trigger background load immediately on import
+threading.Thread(target=load_models_background, daemon=True).start()
+
+# Global OCR Queue (Reduced size to prevent latency backlog)
+ocr_queue = queue.Queue(maxsize=10)
+
+def ocr_worker_loop():
+    global lp_model, reader, models_loaded
+    while True:
+        try:
+            item = ocr_queue.get()
+            if item is None:
+                break
+            tid, crop, active_sessions = item
+            
+            # FAST DISCARD: If vehicle left or already has enough reads, skip heavy OCR!
+            if tid not in active_sessions or len(active_sessions[tid].get("plate_reads", [])) >= 10:
+                ocr_queue.task_done()
+                continue
+            
+            if not models_loaded or reader is None:
+                ocr_queue.task_done()
+                continue
+                
+            plate_crop = None
+            if lp_model:
+                lp_results = lp_model(crop, conf=0.20, verbose=False)
+                for r in lp_results:
+                    if len(r.boxes) > 0:
+                        best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
+                        px1, py1, px2, py2 = best_box.xyxy[0].tolist()
+                        w, h = px2 - px1, py2 - py1
+                        pad_x, pad_y = int(w * 0.1), int(h * 0.1)
+                        px1, py1 = max(0, int(px1) - pad_x), max(0, int(py1) - pad_y)
+                        px2, py2 = min(crop.shape[1], int(px2) + pad_x), min(crop.shape[0], int(py2) + pad_y)
+                        plate_crop = crop[py1:py2, px1:px2]
+                        break
+                        
+            if plate_crop is None or plate_crop.size == 0:
+                plate_crop = crop[int(crop.shape[0] * 0.70):, :]
+
+            if plate_crop is not None and plate_crop.size > 0:
+                enhanced = enhance_plate(plate_crop)
+                # Use cls=False for speed
+                result = reader.ocr(enhanced, cls=False)
+                if result and result[0]:
+                    for line in result[0]:
+                        text = line[1][0]
+                        prob = line[1][1]
+                        if prob > 0.20:
+                            cleaned = clean_plate(text)
+                            if cleaned and tid in active_sessions:
+                                active_sessions[tid]["plate_reads"].append(cleaned)
+                                active_sessions[tid]["plate_confidences"].append(float(prob * 100))
+                                
+            ocr_queue.task_done()
+        except Exception as e:
+            print(f"OCR Worker Error: {e}")
+
+# Start OCR worker thread
+threading.Thread(target=ocr_worker_loop, daemon=True).start()
+
+def create_text_frame(text, width=1280, height=720):
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1.0
+    thickness = 2
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    x = (width - tw) // 2
+    y = (height + th) // 2
+    cv2.putText(frame, text, (x, y), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
+    ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    return (b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
 # Global lock for single-instance pipeline
 pipeline_lock = threading.Lock()
 # Event to signal the running stream to stop
 stop_signal = threading.Event()
+
+class PushBuffer:
+    """Holds the most recent frame pushed via WebSocket or HTTP POST by a mobile device."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame = None
+        self.last_rx = 0.0
+        self.frame_count = 0
+        self.dropped_count = 0
+        self.fps_calc = 0.0
+        self._fps_window = []
+
+    def put_jpeg(self, jpeg_bytes: bytes) -> bool:
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            with self.lock:
+                self.dropped_count += 1
+            return False
+        
+        now = time.time()
+        with self.lock:
+            self.frame = frame
+            self.last_rx = now
+            self.frame_count += 1
+            self._fps_window.append(now)
+            cutoff = now - 2.0
+            self._fps_window = [t for t in self._fps_window if t > cutoff]
+            if len(self._fps_window) > 1:
+                self.fps_calc = len(self._fps_window) / (self._fps_window[-1] - self._fps_window[0])
+        return True
+
+    def read(self):
+        with self.lock:
+            if self.frame is None or not self.alive:
+                return False, None
+            return True, self.frame.copy()
+
+    @property
+    def alive(self):
+        return (time.time() - self.last_rx) < 5.0
+
+    def isOpened(self):
+        return True
+
+    def get(self, prop):
+        with self.lock:
+            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                return self.frame.shape[1] if self.frame is not None else 1280
+            if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                return self.frame.shape[0] if self.frame is not None else 720
+            if prop == cv2.CAP_PROP_FPS:
+                return self.fps_calc if self.fps_calc > 0 else 30.0
+        return 0
+
+    def release(self):
+        pass
+
+push_buffer = PushBuffer()
+
+@app.websocket("/api/camera/ws-push")
+async def websocket_camera_push(websocket: WebSocket):
+    """Ultra-low latency (<30ms) WebSocket stream receiver for mobile phones."""
+    await websocket.accept()
+    print("📱 Mobile WebSocket camera streaming connected!")
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            if data:
+                push_buffer.put_jpeg(data)
+                # Send ack so client can synchronize backpressure
+                await websocket.send_text("ack")
+    except WebSocketDisconnect:
+        print("📱 Mobile WebSocket camera disconnected.")
+    except Exception as e:
+        print(f"📱 WebSocket stream error: {e}")
+
+@app.post("/api/camera/push")
+async def camera_push(request: Request):
+    """HTTP Fallback push endpoint for mobile frames."""
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        form = await request.form()
+        if "frame" in form:
+            data = await form["frame"].read()
+        else:
+            return {"error": "empty frame"}
+    else:
+        data = await request.body()
+        
+    if not data:
+        return {"error": "empty frame"}
+        
+    if not push_buffer.put_jpeg(data):
+        return {"error": "could not decode frame"}
+    return {"ok": True}
+
+@app.get("/api/camera/push/status")
+def camera_push_status():
+    return {
+        "alive": push_buffer.alive,
+        "fps": round(push_buffer.fps_calc, 1),
+        "total_frames": push_buffer.frame_count,
+        "dropped_frames": push_buffer.dropped_count
+    }
+
+class FreshFrameReader:
+    """Ultra-low latency, zero-frame-drop non-blocking video reader with auto-reconnect watchdog."""
+    def __init__(self, src: str):
+        self.src = src
+        self.lock = threading.Lock()
+        self.frame = None
+        self.ret = False
+        self.running = True
+        self.last_frame_time = 0.0
+        self.width = 1280
+        self.height = 720
+        self.fps = 30.0
+        self.frame_count = 0
+        self.reconnect_count = 0
+        self.status = "connecting"
+        
+        self.cap = None
+        self._init_cap()
+        
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _init_cap(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        
+        print(f"[FreshFrameReader] 🔌 Connecting to {self.src} (TCP transport, no-buffer)...")
+        cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = cap
+
+    def _reader_loop(self):
+        consecutive_fails = 0
+        while self.running:
+            if self.cap is None or not self.cap.isOpened():
+                self.status = "reconnecting"
+                time.sleep(1.0)
+                self._init_cap()
+                self.reconnect_count += 1
+                continue
+
+            ret, frame = self.cap.read()
+            now = time.time()
+
+            if ret and frame is not None and frame.size > 0:
+                consecutive_fails = 0
+                h, w = frame.shape[:2]
+                with self.lock:
+                    self.ret = True
+                    self.frame = frame
+                    self.last_frame_time = now
+                    self.width = w
+                    self.height = h
+                    self.frame_count += 1
+                    self.status = "connected"
+            else:
+                consecutive_fails += 1
+                # If stalled or failing for > 50 iterations or 3 seconds
+                if consecutive_fails > 50 or (now - self.last_frame_time > 3.0 and self.last_frame_time > 0):
+                    print(f"[FreshFrameReader] ⚠️ Stream stall/drop on {self.src}. Reconnecting (attempt {self.reconnect_count + 1})...")
+                    self.status = "reconnecting"
+                    self.reconnect_count += 1
+                    self._init_cap()
+                    consecutive_fails = 0
+                    time.sleep(0.5)
+                else:
+                    time.sleep(0.01)
+
+    def read(self):
+        with self.lock:
+            if not self.ret or self.frame is None:
+                return False, None
+            return True, self.frame.copy()
+
+    def isOpened(self):
+        return self.running and (self.cap is not None and (self.cap.isOpened() or (time.time() - self.last_frame_time < 5.0)))
+
+    def get(self, prop):
+        with self.lock:
+            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                return self.width
+            if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                return self.height
+            if prop == cv2.CAP_PROP_FPS:
+                return self.fps
+        return 0
+
+    def release(self):
+        self.running = False
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 def generate_frames(cam_id: str):
     # Enforce single instance
@@ -59,6 +371,7 @@ def generate_frames(cam_id: str):
         acquired = pipeline_lock.acquire(timeout=5.0)
         if not acquired:
             print("❌ Timeout waiting for previous stream to stop.")
+            yield create_text_frame("ERROR: Another stream is currently running")
             return
             
     stop_signal.clear()
@@ -81,15 +394,32 @@ def generate_frames(cam_id: str):
     speed_limit = cam.speed_limit_kmh or 30
     db.close()
 
-    cap = cv2.VideoCapture(video_source)
+    is_network_stream = str(video_source).startswith(("http://", "https://", "rtsp://", "rtmp://"))
+    if video_source == "push":
+        cap = push_buffer
+    elif is_network_stream:
+        cap = FreshFrameReader(video_source)
+    else:
+        cap = cv2.VideoCapture(video_source)
+
     if not cap.isOpened():
         print(f"[{name}] ⚠️ Cannot open video source: {video_source}")
         pipeline_lock.release()
+        for _ in range(5):
+            yield create_text_frame(f"ERROR: Cannot open video source: {video_source}")
+            time.sleep(1.0)
         return
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    # Wait briefly for first frame if network stream or push stream
+    if is_network_stream or video_source == "push":
+        for _ in range(100): # Wait up to 5 seconds for first frame
+            if cap.read()[0]:
+                break
+            time.sleep(0.05)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     speed_estimator = None
     cal_poly = calibration_polygon_normalized
@@ -144,16 +474,29 @@ def generate_frames(cam_id: str):
     zone_annotator = sv.PolygonZoneAnnotator(zone=speed_zone, color=sv.Color.YELLOW) if speed_zone else None
 
     try:
+        # Wait for models to load, yield loading frames to keep stream alive
+        while not models_loaded:
+            if stop_signal.is_set():
+                break
+            yield create_text_frame("Loading AI Models... Please wait (3-5 mins on first run)")
+            time.sleep(1.0)
+            
         while cap.isOpened():
             if stop_signal.is_set():
                 print(f"[{name}] 🛑 Stop signal received. Exiting generator.")
                 break
 
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret or frame is None:
+                if is_network_stream or video_source == "push":
+                    yield create_text_frame("📱 Waiting for live phone stream... (Ensure phone is streaming)")
+                    time.sleep(0.5)
+                    continue
+                else:
+                    break
 
             frame_counter += 1
+
 
             # 1. Detection
             results = model(frame, classes=[1, 2, 3, 5, 7], conf=0.45, verbose=False)
@@ -208,7 +551,8 @@ def generate_frames(cam_id: str):
                     if inst_speed > active_sessions[tid].get("max_speed_kmh", 0):
                         active_sessions[tid]["max_speed_kmh"] = inst_speed
 
-                if len(active_sessions[tid]["plate_reads"]) < 30:
+                # Reduce to 10 max reads for throttling
+                if len(active_sessions[tid]["plate_reads"]) < 10:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0: ocr_jobs.append((tid, crop.copy()))
             
@@ -216,32 +560,13 @@ def generate_frames(cam_id: str):
             ocr_jobs.sort(key=lambda j: j[1].shape[0] * j[1].shape[1], reverse=True)
             ocr_jobs = ocr_jobs[:3]
 
-            # GPU OCR
+            # Queue GPU OCR asynchronously
             for tid, crop in ocr_jobs:
-                plate_crop = None
-                if lp_model:
-                    lp_results = lp_model(crop, conf=0.20, verbose=False)
-                    for r in lp_results:
-                        if len(r.boxes) > 0:
-                            best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
-                            px1, py1, px2, py2 = best_box.xyxy[0].tolist()
-                            plate_crop = crop[max(0, int(py1)):min(crop.shape[0], int(py2)), max(0, int(px1)):min(crop.shape[1], int(px2))]
-                            break
-                if plate_crop is None or plate_crop.size == 0:
-                    plate_crop = crop[int(crop.shape[0] * 0.70):, :]
-
-                if plate_crop is not None and plate_crop.size > 0:
-                    enhanced = enhance_plate(plate_crop)
-                    result = reader.ocr(enhanced, cls=True)
-                    if result and result[0]:
-                        for line in result[0]:
-                            text = line[1][0]
-                            prob = line[1][1]
-                            if prob > 0.20:
-                                cleaned = correct_indian_plate(text)
-                                if cleaned:
-                                    active_sessions[tid]["plate_reads"].append(cleaned)
-                                    active_sessions[tid]["plate_confidences"].append(float(prob * 100))
+                if tid in active_sessions and len(active_sessions[tid]["plate_reads"]) < 10:
+                    try:
+                        ocr_queue.put_nowait((tid, crop, active_sessions))
+                    except queue.Full:
+                        pass
 
             # Database Flush (Stale)
             stale_tids = [t for t, data in active_sessions.items() if frame_counter - data["last_seen"] > 60]
@@ -312,3 +637,56 @@ def generate_frames(cam_id: str):
 @app.get("/api/stream/{cam_id}")
 def stream_camera(cam_id: str, request: Request):
     return StreamingResponse(generate_frames(cam_id), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/api/camera/frame")
+def get_camera_frame():
+    ret, frame = push_buffer.read()
+    if ret and frame is not None:
+        ret_enc, buffer = cv2.imencode('.jpg', frame)
+        if ret_enc:
+            from fastapi.responses import Response
+            return Response(content=buffer.tobytes(), media_type="image/jpeg")
+    raise HTTPException(status_code=404, detail="No push frame available")
+
+@app.get("/api/camera/stream-info")
+def get_stream_info():
+    return {
+        "push_buffer": {
+            "alive": push_buffer.alive,
+            "fps": round(push_buffer.fps_calc, 1),
+            "total_frames": push_buffer.frame_count,
+            "dropped_frames": push_buffer.dropped_count,
+            "resolution": f"{push_buffer.get(cv2.CAP_PROP_FRAME_WIDTH)}x{push_buffer.get(cv2.CAP_PROP_FRAME_HEIGHT)}" if push_buffer.alive else None
+        }
+    }
+
+
+@app.post("/api/cameras/{cam_id}/source")
+def update_camera_source(cam_id: str, url: str = Body(..., embed=True)):
+    """
+    Update the video source (e.g., to a mobile stream URL) for a camera.
+    Example body: {"url": "http://192.168.1.100:8080/video"}
+    """
+    db = SessionLocal()
+    try:
+        cam = db.query(Camera).filter(Camera.id == cam_id).first()
+        if not cam:
+            raise HTTPException(status_code=404, detail="Camera not found")
+        
+        old_source = cam.video_source
+        cam.video_source = url
+        db.commit()
+        
+        # If the stream is running, stop it so it restarts with the new source
+        if pipeline_lock.acquire(blocking=False):
+            pipeline_lock.release()
+        else:
+            stop_signal.set()
+            
+        return {"message": "Camera source updated successfully", "old_source": old_source, "new_source": url}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+

@@ -5,11 +5,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import cv2
 import os
+import socket
 import shutil
+import numpy as np
 from typing import Optional, List
 
 from database import SessionLocal, init_db
 from models import Camera, PremiseAccessLog, Violation
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
 
 app = FastAPI(title="Traffic Analytics Web Configurator & Dashboard")
 
@@ -44,12 +57,32 @@ class ConfigPayload(BaseModel):
     calibration_polygon: Optional[List[PointCoordinate]] = None
     distance_between_lines_meters: Optional[float] = None
 
+class SourcePayload(BaseModel):
+    video_source: str
+
 class AcknowledgePayload(BaseModel):
     status: str
 
 # Mount static files (the built React app and assets)
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/api/system/network-info")
+def get_network_info(request: Request):
+    host_header = request.headers.get("host", "")
+    client_host = host_header.split(":")[0] if host_header else ""
+    
+    if client_host and client_host not in ("localhost", "127.0.0.1") and not client_host.startswith("172."):
+        ip = client_host
+    else:
+        ip = os.getenv("HOST_IP", get_local_ip())
+        
+    return {
+        "local_ip": ip,
+        "phone_stream_url": f"http://{ip}:8002/phone",
+        "pipeline_stream_url": f"http://{ip}:8001/api/stream"
+    }
+
 
 @app.get("/api/cameras")
 def get_cameras():
@@ -84,8 +117,60 @@ def get_cameras():
     db.close()
     return result
 
+@app.post("/api/cameras/{cam_id}/source")
+def update_camera_source(cam_id: str, payload: SourcePayload):
+    db = SessionLocal()
+    cam = db.query(Camera).filter(Camera.id == cam_id).first()
+    if not cam:
+        db.close()
+        raise HTTPException(status_code=404, detail="Camera not found")
+    
+    old_source = cam.video_source
+    cam.video_source = payload.video_source
+    if payload.video_source == "push":
+        cam.name = f"Phone Web Camera ({cam.name.split('(')[0].strip()})"
+    elif payload.video_source.startswith(("rtsp://", "http://", "https://")):
+        cam.name = f"Mobile RTSP Feed ({cam.name.split('(')[0].strip()})"
+    
+    db.commit()
+    db.close()
+    return {"status": "success", "old_source": old_source, "new_source": payload.video_source}
+
+latest_push_jpeg = None
+latest_push_time = 0.0
+
+@app.post("/api/camera/push")
+async def camera_push_receiver(request: Request):
+    global latest_push_jpeg, latest_push_time
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        form = await request.form()
+        if "frame" in form:
+            data = await form["frame"].read()
+        else:
+            return {"error": "empty frame"}
+    else:
+        data = await request.body()
+
+    if not data:
+        return {"error": "empty frame"}
+
+    latest_push_jpeg = data
+    latest_push_time = time.time()
+
+    # Forward asynchronously to pipeline engine container if running
+    for target_url in ["http://app:8001/api/camera/push", "http://localhost:8001/api/camera/push"]:
+        try:
+            req = urllib.request.Request(target_url, data=data, headers={'Content-Type': 'image/jpeg'})
+            with urllib.request.urlopen(req, timeout=0.3):
+                break
+        except Exception:
+            continue
+
+    return {"ok": True}
+
 @app.get("/api/cameras/{cam_id}/frame")
 def get_camera_frame(cam_id: str):
+    global latest_push_jpeg, latest_push_time
     db = SessionLocal()
     cam = db.query(Camera).filter(Camera.id == cam_id).first()
     db.close()
@@ -95,14 +180,47 @@ def get_camera_frame(cam_id: str):
         
     video_source = cam.video_source.strip("'\"")
     
+    if video_source == "push":
+        # 1. Check if we have recent push bytes in local web_ui memory
+        if latest_push_jpeg is not None and (time.time() - latest_push_time < 30.0):
+            return Response(content=latest_push_jpeg, media_type="image/jpeg")
+
+        # 2. Attempt to fetch the live snapshot frame from the running pipeline container
+        for target_url in ["http://app:8001/api/camera/frame", "http://localhost:8001/api/camera/frame"]:
+            try:
+                req = urllib.request.Request(target_url, headers={'User-Agent': 'TrafficCV-Web'})
+                with urllib.request.urlopen(req, timeout=1.2) as resp:
+                    if resp.status == 200:
+                        return Response(content=resp.read(), media_type="image/jpeg")
+            except Exception:
+                continue
+
+        # If no frame received yet, create helpful placeholder with instructions
+        placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.putText(placeholder, "MOBILE WEB STREAM (WAITING FOR PHONE)", (220, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (16, 185, 129), 3)
+        ip = os.getenv("HOST_IP", get_local_ip())
+        cv2.putText(placeholder, f"Open http://{ip}:8002/phone on your mobile browser", (230, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(placeholder, "and tap 'Start Live Stream', then click Refresh Frame!", (230, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (160, 160, 160), 2)
+        _, buffer = cv2.imencode('.jpg', placeholder)
+        return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000|stimeout;3000000"
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail=f"Could not open video source: {video_source}")
         
-    ret, frame = cap.read()
+    ret = False
+    frame = None
+    for _ in range(10):
+        ret, frame = cap.read()
+        if ret and frame is not None and frame.size > 0:
+            break
+            
     cap.release()
     
-    if not ret:
+    if not ret or frame is None:
         raise HTTPException(status_code=400, detail="Could not read frame from video")
         
     # Encode as JPEG
@@ -234,6 +352,13 @@ def acknowledge_violation(violation_id: str, payload: AcknowledgePayload):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+@app.get("/phone")
+def phone_page():
+    phone_path = os.path.join("static", "phone.html")
+    if os.path.exists(phone_path):
+        return FileResponse(phone_path)
+    return RedirectResponse(url="/static/index.html")
 
 # Root redirect to the index file
 @app.get("/")

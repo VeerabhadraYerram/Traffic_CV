@@ -114,4 +114,22 @@ export const dataService = {
       }
     );
   },
+
+  /** Updates the camera video source (e.g. RTSP or push) */
+  updateCameraSource: (cameraId: string, videoSource: string) =>
+    apiFetch<{ status: string; old_source: string; new_source: string }>(
+      `/api/cameras/${cameraId}/source`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_source: videoSource }),
+      }
+    ),
+
+  /** Gets host network info and mobile pairing links */
+  getNetworkInfo: () =>
+    apiFetch<{ local_ip: string; phone_stream_url: string; pipeline_stream_url: string }>(
+      '/api/system/network-info'
+    ),
 };
+

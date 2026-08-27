@@ -5,10 +5,17 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # The Docker setup will inject DATABASE_URL, e.g. postgresql://user:password@postgres:5432/traffic
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:adminpassword@localhost:5435/traffic")
 
-engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+try:
+    engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+except Exception:
+    # Fallback to local SQLite if postgres driver is not installed in host environment
+    DATABASE_URL = "sqlite:///traffic.db"
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

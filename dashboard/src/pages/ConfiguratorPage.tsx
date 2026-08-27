@@ -2,10 +2,11 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type { ChangeEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { SlidersHorizontal, Pencil, Minus, RotateCcw, Save, Info, Hexagon, Upload, Eye, EyeOff } from 'lucide-react';
+import { SlidersHorizontal, Pencil, Minus, RotateCcw, Save, Info, Hexagon, Upload, Eye, EyeOff, Smartphone, Radio, Globe, Copy, Check, Video } from 'lucide-react';
 import { dataService } from '@/lib/state-store';
 import type { ConfiguratorCamera, NormalizedLine, NormalizedPoint } from '@/types';
 import { cn } from '@/lib/utils';
+
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -136,6 +137,18 @@ export function ConfiguratorPage() {
   const [frameError, setFrameError] = useState(false);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
 
+  // Mobile Stream & Source State
+  const [customSource, setCustomSource] = useState('');
+  const [isUpdatingSource, setIsUpdatingSource] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // ── Fetch network info ──────────────────────────────────────────────────
+  const { data: networkInfo } = useQuery({
+    queryKey: ['network-info'],
+    queryFn: () => dataService.getNetworkInfo(),
+    staleTime: 300_000,
+  });
+
   // ── Fetch cameras ─────────────────────────────────────────────────────────
   const { data: cameras = [], isLoading } = useQuery({
     queryKey: ['cameras'],
@@ -144,6 +157,41 @@ export function ConfiguratorPage() {
   });
 
   const selectedCamera = cameras.find((c) => c.id === selectedId) ?? null;
+
+  const handleSourceUpdate = async (newSource: string) => {
+    if (!selectedId || !newSource.trim()) return;
+    setIsUpdatingSource(true);
+    try {
+      await dataService.updateCameraSource(selectedId, newSource.trim());
+      toast.success(`Video source updated to ${newSource.trim()}`);
+      queryClient.invalidateQueries({ queryKey: ['cameras'] });
+      setRefreshTrigger((prev) => prev + 1);
+    } catch (err: any) {
+      toast.error(`Failed to update source: ${err.message || err}`);
+    } finally {
+      setIsUpdatingSource(false);
+    }
+  };
+
+  const getBroadcastUrl = () => {
+    if (networkInfo?.phone_stream_url && !networkInfo.phone_stream_url.includes('172.')) {
+      return networkInfo.phone_stream_url;
+    }
+    const host = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1' 
+      ? window.location.hostname 
+      : '192.168.29.62';
+    return `http://${host}:8002/phone`;
+  };
+
+  const copyMobileUrl = () => {
+    const url = getBroadcastUrl();
+    navigator.clipboard.writeText(url);
+    setCopied(true);
+    toast.success('Mobile URL copied to clipboard!');
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+
 
   // ── Load frame when camera changes ────────────────────────────────────────
   useEffect(() => {
@@ -465,15 +513,88 @@ export function ConfiguratorPage() {
               </select>
             )}
 
-            {/* Camera meta */}
+            {/* Camera Meta & Stream Source Selection */}
             {selectedCamera && (
-              <div className="rounded-md bg-muted/50 p-3 text-xs space-y-2 text-muted-foreground">
+              <div className="rounded-md bg-muted/50 p-3 text-xs space-y-3 text-muted-foreground">
                 <div className="flex justify-between items-center">
-                  <span>Source File</span>
-                  <span className="font-mono text-[10px] text-foreground truncate max-w-[150px]" title={selectedCamera.video_source}>
-                    {selectedCamera.video_source.split('/').pop()}
+                  <span className="font-medium text-foreground">Active Source:</span>
+                  <span className="font-mono text-[10px] text-foreground truncate max-w-[160px] bg-background px-1.5 py-0.5 rounded border" title={selectedCamera.video_source}>
+                    {selectedCamera.video_source}
                   </span>
                 </div>
+
+                {/* Quick Switch Buttons */}
+                <div className="grid grid-cols-2 gap-1.5 pt-1">
+                  <button
+                    onClick={() => handleSourceUpdate('push')}
+                    disabled={isUpdatingSource || selectedCamera.video_source === 'push'}
+                    className={cn(
+                      "flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-semibold border transition-all",
+                      selectedCamera.video_source === 'push'
+                        ? "bg-emerald-500/15 border-emerald-500 text-emerald-600 dark:text-emerald-400"
+                        : "bg-background hover:bg-accent border-border text-foreground"
+                    )}
+                  >
+                    <Smartphone className="h-3.5 w-3.5" />
+                    Phone Camera
+                  </button>
+
+                  <button
+                    onClick={() => handleSourceUpdate('/app/downloads/test_video.mp4')}
+                    disabled={isUpdatingSource || selectedCamera.video_source.includes('test_video')}
+                    className={cn(
+                      "flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-semibold border transition-all",
+                      selectedCamera.video_source.includes('test_video')
+                        ? "bg-blue-500/15 border-blue-500 text-blue-600 dark:text-blue-400"
+                        : "bg-background hover:bg-accent border-border text-foreground"
+                    )}
+                  >
+                    <Video className="h-3.5 w-3.5" />
+                    Test Video
+                  </button>
+                </div>
+
+                {/* Custom RTSP / HTTP URL Input */}
+                <div className="pt-2 border-t border-border space-y-1.5">
+                  <label className="text-[11px] font-medium text-foreground flex items-center gap-1.5">
+                    <Radio className="h-3 w-3 text-cyan-500" />
+                    Mobile RTSP / IP Camera URL:
+                  </label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      placeholder="rtsp://192.168.1.X:8554/live"
+                      value={customSource}
+                      onChange={(e) => setCustomSource(e.target.value)}
+                      className="flex-1 rounded-md border border-input bg-background px-2.5 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                    <button
+                      onClick={() => handleSourceUpdate(customSource)}
+                      disabled={isUpdatingSource || !customSource.trim()}
+                      className="rounded-md bg-primary text-primary-foreground hover:bg-primary/90 px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-50"
+                    >
+                      Connect
+                    </button>
+                  </div>
+                </div>
+
+                {/* Mobile Pairing URL banner */}
+                <div className="pt-2 border-t border-border space-y-1">
+                  <div className="text-[10px] text-muted-foreground flex justify-between items-center">
+                    <span className="flex items-center gap-1"><Globe className="h-3 w-3 text-emerald-500" /> Mobile Broadcast URL:</span>
+                    <button
+                      onClick={copyMobileUrl}
+                      className="hover:text-foreground text-primary flex items-center gap-0.5 font-medium"
+                    >
+                      {copied ? <Check className="h-2.5 w-2.5" /> : <Copy className="h-2.5 w-2.5" />}
+                      {copied ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <div className="bg-background/80 rounded p-1.5 font-mono text-[10px] text-emerald-600 dark:text-emerald-400 select-all border border-emerald-500/20 break-all">
+                    {getBroadcastUrl()}
+                  </div>
+                </div>
+
                 
                 <div className="pt-2 border-t border-border">
                   <input type="file" accept="video/mp4,video/x-m4v,video/*" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
@@ -483,11 +604,12 @@ export function ConfiguratorPage() {
                     className="w-full flex items-center justify-center gap-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80 px-2 py-1.5 text-xs font-medium transition-colors"
                   >
                     <Upload className="h-3.5 w-3.5" />
-                    {uploading ? 'Uploading...' : 'Upload New Video'}
+                    {uploading ? 'Uploading...' : 'Upload Video File'}
                   </button>
                 </div>
               </div>
             )}
+
           </div>
 
           {/* Configuration Inputs */}
@@ -706,6 +828,19 @@ export function ConfiguratorPage() {
 
         {/* ── Canvas Panel ── */}
         <div className="flex-1 rounded-lg border bg-black overflow-hidden flex items-center justify-center relative min-h-[500px]">
+          {selectedId && (
+            <div className="absolute top-3 right-3 z-20 flex gap-2">
+              <button
+                onClick={() => setRefreshTrigger((prev) => prev + 1)}
+                className="flex items-center gap-1.5 bg-background/90 hover:bg-background text-foreground border border-border px-3 py-1.5 rounded-md text-xs font-semibold shadow-lg backdrop-blur transition-all"
+                title="Fetch latest snapshot from the live camera to draw lines on"
+              >
+                <RotateCcw className="h-3.5 w-3.5 text-primary" />
+                Refresh Live Snapshot
+              </button>
+            </div>
+          )}
+
           {!selectedId && (
             <div className="text-center text-muted-foreground space-y-2">
               <SlidersHorizontal className="h-12 w-12 mx-auto opacity-20" />
@@ -731,6 +866,7 @@ export function ConfiguratorPage() {
             onMouseMove={handleMouseMove}
           />
         </div>
+
       </div>
     </div>
   );

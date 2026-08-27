@@ -26,7 +26,7 @@ services:
       # Map the local codebase for instant code reloads
       - ./:/app
       # Universal video data mapping
-      - ./downloads:/app/downloads
+      - ./data/downloads:/app/downloads
       # Persist EasyOCR models so it doesn't crash on DNS timeouts
       - easyocr_models:/root/.EasyOCR/model
     dns:
@@ -51,10 +51,10 @@ services:
     environment:
       - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
     ports:
-      - "8000:8000"
+      - "8002:8000"
     volumes:
       - ./:/app
-      - ./downloads:/app/downloads
+      - ./data/downloads:/app/downloads
     depends_on:
       - db
 

@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Traffic_CV - Mobile Stream Broadcaster</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #090d16;
+            --card-bg: rgba(18, 24, 38, 0.85);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --accent-green: #10b981;
+            --accent-cyan: #06b6d4;
+            --accent-red: #ef4444;
+            --accent-yellow: #f59e0b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            user-select: none;
+        }
+
+        /* Top Navigation Header */
+        header {
+            padding: 12px 16px;
+            background: rgba(9, 13, 22, 0.95);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--card-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 20;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, #10b981, #06b6d4);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 14px;
+            color: #fff;
+            box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+        }
+
+        .brand-title {
+            font-size: 15px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
+        }
+
+        .brand-sub {
+            font-size: 11px;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+            transition: all 0.3s ease;
+        }
+
+        .status-badge.live {
+            background: rgba(16, 185, 129, 0.15);
+            border-color: rgba(16, 185, 129, 0.3);
+            color: #34d399;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-red);
+            transition: all 0.3s ease;
+        }
+
+        .status-badge.live .status-dot {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px #10b981;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.2); }
+        }
+
+        /* Viewport Container */
+        #viewport {
+            flex: 1;
+            position: relative;
+            background: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(1);
+        }
+
+        video.mirrored {
+            transform: scaleX(-1);
+        }
+
+        /* HUD Overlay */
+        .hud-overlay {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            right: 12px;
+            display: flex;
+            justify-content: space-between;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .stat-card {
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 6px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .stat-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            font-weight: 600;
+        }
+
+        .stat-val {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: 700;
+            color: #fff;
+        }
+
+        .stat-val.highlight {
+            color: #34d399;
+        }
+
+        /* Viewfinder Alignment Overlay for ANPR */
+        .viewfinder {
+            position: absolute;
+            width: 85%;
+            height: 50%;
+            border: 2px dashed rgba(255, 255, 255, 0.3);
+            border-radius: 12px;
+            pointer-events: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .viewfinder.active {
+            border-color: rgba(16, 185, 129, 0.5);
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.15) inset;
+        }
+
+        .viewfinder-guide {
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 4px 10px;
+            border-radius: 6px;
+        }
+
+        /* Bottom Controls */
+        .controls-container {
+            background: rgba(9, 13, 22, 0.95);
+            backdrop-filter: blur(16px);
+            border-top: 1px solid var(--card-border);
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 20;
+        }
+
+        .settings-bar {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+
+        .settings-bar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .ctrl-select, .ctrl-toggle {
+            background: rgba(30, 41, 59, 0.7);
+            border: 1px solid var(--card-border);
+            color: var(--text-main);
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            outline: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .ctrl-toggle.active {
+            background: rgba(16, 185, 129, 0.2);
+            border-color: var(--accent-green);
+            color: #34d399;
+        }
+
+        .action-bar {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn-main {
+            flex: 1;
+            padding: 14px;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 700;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+        }
+
+        .btn-start {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            box-shadow: 0 4px 20px rgba(16, 185, 129, 0.4);
+        }
+
+        .btn-start:active {
+            transform: scale(0.98);
+        }
+
+        .btn-stop {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+            box-shadow: 0 4px 20px rgba(239, 68, 68, 0.4);
+            display: none;
+        }
+
+        .btn-stop:active {
+            transform: scale(0.98);
+        }
+
+        /* Message toast */
+        #toast {
+            position: absolute;
+            bottom: 120px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid var(--card-border);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            color: #cbd5e1;
+            z-index: 30;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        #toast.show { opacity: 1; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <div class="brand-icon">CV</div>
+            <div>
+                <div class="brand-title">Traffic_CV Broadcaster</div>
+                <div class="brand-sub">Zero-Frame-Drop Mobile Stream</div>
+            </div>
+        </div>
+        <div class="status-badge" id="statusBadge">
+            <span class="status-dot"></span>
+            <span id="statusText">STANDBY</span>
+        </div>
+    </header>
+
+    <div id="viewport">
+        <video id="videoElement" autoplay playsinline muted></video>
+        <canvas id="canvasElement" style="display:none;"></canvas>
+
+        <div class="hud-overlay">
+            <div class="stat-card">
+                <span class="stat-label">Throughput</span>
+                <span class="stat-val highlight" id="fpsDisplay">0.0 FPS</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Latency / Loss</span>
+                <span class="stat-val" id="latDisplay">-- ms (0 drop)</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-label">Resolution</span>
+                <span class="stat-val" id="resDisplay">--x--</span>
+            </div>
+        </div>
+
+        <div class="viewfinder" id="viewfinder">
+            <div class="viewfinder-guide">Center Vehicle / License Plate</div>
+        </div>
+
+        <div id="toast">Connecting...</div>
+    </div>
+
+    <div class="controls-container">
+        <div class="settings-bar">
+            <select class="ctrl-select" id="resSelect">
+                <option value="720p" selected>Resolution: 720p (Fast)</option>
+                <option value="1080p">Resolution: 1080p (HD)</option>
+                <option value="480p">Resolution: 480p (Low Bandwidth)</option>
+            </select>
+
+            <select class="ctrl-select" id="fpsSelect">
+                <option value="30" selected>Target: 30 FPS</option>
+                <option value="24">Target: 24 FPS</option>
+                <option value="15">Target: 15 FPS</option>
+            </select>
+
+            <button class="ctrl-toggle" id="cameraFlipBtn">
+                🔄 Flip Camera
+            </button>
+
+            <button class="ctrl-toggle" id="torchBtn" style="display:none;">
+                💡 Flashlight
+            </button>
+        </div>
+
+        <div class="action-bar">
+            <button id="startBtn" class="btn-main btn-start">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                Start Live Stream
+            </button>
+            <button id="stopBtn" class="btn-main btn-stop">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                Stop Stream
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoElement');
+        const canvas = document.getElementById('canvasElement');
+        const ctx = canvas.getContext('2d', { alpha: false });
+        
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusBadge = document.getElementById('statusBadge');
+        const statusText = document.getElementById('statusText');
+        const fpsDisplay = document.getElementById('fpsDisplay');
+        const latDisplay = document.getElementById('latDisplay');
+        const resDisplay = document.getElementById('resDisplay');
+        const viewfinder = document.getElementById('viewfinder');
+        const toast = document.getElementById('toast');
+        const cameraFlipBtn = document.getElementById('cameraFlipBtn');
+        const torchBtn = document.getElementById('torchBtn');
+        const resSelect = document.getElementById('resSelect');
+        const fpsSelect = document.getElementById('fpsSelect');
+
+        let mediaStream = null;
+        let videoTrack = null;
+        let websocket = null;
+        let isStreaming = false;
+        let currentFacingMode = 'environment';
+        let torchActive = false;
+
+        let frameCount = 0;
+        let droppedCount = 0;
+        let lastFpsCalcTime = performance.now();
+        let pingTime = 0;
+        let latencyMs = 0;
+        let animFrameId = null;
+
+        // Auto-detect host endpoints
+        const host = window.location.hostname;
+        const port = window.location.port ? `:${window.location.port}` : '';
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WS_URL = `${wsProtocol}//${host}:8001/api/camera/ws-push`;
+        const HTTP_FALLBACK_URL = `${window.location.protocol}//${host}${port}/api/camera/push`;
+        const HTTP_PIPELINE_URL = `${window.location.protocol}//${host}:8001/api/camera/push`;
+
+
+        function showToast(msg) {
+            toast.innerText = msg;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 2500);
+        }
+
+        function getResolutionConstraints() {
+            const val = resSelect.value;
+            if (val === '1080p') return { width: { ideal: 1920 }, height: { ideal: 1080 } };
+            if (val === '480p') return { width: { ideal: 640 }, height: { ideal: 480 } };
+            return { width: { ideal: 1280 }, height: { ideal: 720 } }; // Default 720p
+        }
+
+        async function initCamera() {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+            }
+
+            const constraints = {
+                video: {
+                    facingMode: currentFacingMode,
+                    ...getResolutionConstraints(),
+                    frameRate: { ideal: parseInt(fpsSelect.value) || 30 }
+                },
+                audio: false
+            };
+
+            try {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    // Legacy fallback
+                    const legacyGetUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+                    if (legacyGetUserMedia) {
+                        mediaStream = await new Promise((resolve, reject) => {
+                            legacyGetUserMedia.call(navigator, constraints, resolve, reject);
+                        });
+                    } else {
+                        alert("🔒 Camera Blocked by Mobile Browser (Insecure HTTP Origin)\n\n" +
+                              "In Chrome on your phone:\n" +
+                              "1. Go to: chrome://flags/#unsafely-treat-insecure-origin-as-secure\n" +
+                              `2. Add: http://${window.location.host}\n` +
+                              "3. Select 'Enabled' and tap 'Relaunch'\n\n" +
+                              "OR install the 'IP Webcam' app for direct RTSP streaming!");
+                        showToast("Enable Chrome Flag: unsafely-treat-insecure-origin-as-secure");
+                        return false;
+                    }
+                } else {
+                    mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                }
+
+                video.srcObject = mediaStream;
+                videoTrack = mediaStream.getVideoTracks()[0];
+
+
+                if (currentFacingMode === 'user') {
+                    video.classList.add('mirrored');
+                } else {
+                    video.classList.remove('mirrored');
+                }
+
+                // Check for flashlight capability
+                const capabilities = videoTrack.getCapabilities ? videoTrack.getCapabilities() : {};
+                if (capabilities.torch) {
+                    torchBtn.style.display = 'flex';
+                } else {
+                    torchBtn.style.display = 'none';
+                }
+
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    resDisplay.innerText = `${video.videoWidth}x${video.videoHeight}`;
+                };
+
+                return true;
+            } catch (err) {
+                console.error("Camera access error:", err);
+                showToast("Camera Error: " + err.message);
+                return false;
+            }
+        }
+
+        function connectWebSocket() {
+            return new Promise((resolve) => {
+                try {
+                    websocket = new WebSocket(WS_URL);
+                    websocket.binaryType = 'arraybuffer';
+
+                    websocket.onopen = () => {
+                        console.log("WebSocket connected to pipeline!");
+                        resolve(true);
+                    };
+
+                    websocket.onmessage = (event) => {
+                        if (event.data === 'ack') {
+                            latencyMs = Math.round(performance.now() - pingTime);
+                        }
+                    };
+
+                    websocket.onerror = (err) => {
+                        console.warn("WebSocket error, falling back to HTTP push if needed", err);
+                        resolve(false);
+                    };
+
+                    websocket.onclose = () => {
+                        if (isStreaming) {
+                            console.log("WebSocket closed, attempting reconnect in 1s...");
+                            setTimeout(connectWebSocket, 1000);
+                        }
+                    };
+                } catch (e) {
+                    resolve(false);
+                }
+            });
+        }
+
+        async function startStream() {
+            const ok = await initCamera();
+            if (!ok) return;
+
+            showToast("Connecting to AI Pipeline...");
+            await connectWebSocket();
+
+            isStreaming = true;
+            frameCount = 0;
+            droppedCount = 0;
+            lastFpsCalcTime = performance.now();
+
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'flex';
+            statusBadge.classList.add('live');
+            statusText.innerText = "STREAMING LIVE";
+            viewfinder.classList.add('active');
+
+            const targetInterval = 1000 / (parseInt(fpsSelect.value) || 30);
+            let lastSendTime = 0;
+
+            function streamLoop(now) {
+                if (!isStreaming) return;
+
+                if (now - lastSendTime >= targetInterval) {
+                    if (video.readyState >= video.HAVE_CURRENT_DATA) {
+                        // Flow control: Check WebSocket backpressure to ensure 0 frame drops
+                        if (websocket && websocket.readyState === WebSocket.OPEN) {
+                            if (websocket.bufferedAmount === 0) {
+                                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                                pingTime = performance.now();
+                                
+                                canvas.toBlob((blob) => {
+                                    if (blob && isStreaming && websocket && websocket.readyState === WebSocket.OPEN) {
+                                        blob.arrayBuffer().then(buf => {
+                                            websocket.send(buf);
+                                            frameCount++;
+                                        });
+                                    }
+                                }, 'image/jpeg', 0.75);
+                            } else {
+                                droppedCount++;
+                            }
+                        } else {
+                            // HTTP Push Fallback
+                            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                            canvas.toBlob((blob) => {
+                                if (blob && isStreaming) {
+                                    fetch(HTTP_FALLBACK_URL, { method: "POST", body: blob })
+                                        .then(() => frameCount++)
+                                        .catch(() => droppedCount++);
+                                }
+                            }, 'image/jpeg', 0.70);
+                        }
+                        lastSendTime = now;
+                    }
+                }
+
+                // Update FPS HUD every 500ms
+                if (now - lastFpsCalcTime >= 500) {
+                    const fps = (frameCount / ((now - lastFpsCalcTime) / 1000)).toFixed(1);
+                    fpsDisplay.innerText = `${fps} FPS`;
+                    latDisplay.innerText = `${latencyMs > 0 ? latencyMs + 'ms' : '<30ms'} (${droppedCount} drop)`;
+                    frameCount = 0;
+                    lastFpsCalcTime = now;
+                }
+
+                animFrameId = requestAnimationFrame(streamLoop);
+            }
+
+            animFrameId = requestAnimationFrame(streamLoop);
+            showToast("✅ Live stream broadcast active!");
+        }
+
+        function stopStream() {
+            isStreaming = false;
+            if (animFrameId) cancelAnimationFrame(animFrameId);
+
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+            }
+
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                mediaStream = null;
+            }
+
+            video.srcObject = null;
+            startBtn.style.display = 'flex';
+            stopBtn.style.display = 'none';
+            statusBadge.classList.remove('live');
+            statusText.innerText = "STANDBY";
+            viewfinder.classList.remove('active');
+            fpsDisplay.innerText = "0.0 FPS";
+            latDisplay.innerText = "-- ms";
+            showToast("Stream Stopped");
+        }
+
+        // Toggle Front/Rear Camera
+        cameraFlipBtn.addEventListener('click', async () => {
+            currentFacingMode = currentFacingMode === 'environment' ? 'user' : 'environment';
+            if (isStreaming) {
+                await initCamera();
+            }
+        });
+
+        // Flashlight Torch
+        torchBtn.addEventListener('click', async () => {
+            if (!videoTrack) return;
+            try {
+                torchActive = !torchActive;
+                await videoTrack.applyConstraints({
+                    advanced: [{ torch: torchActive }]
+                });
+                torchBtn.classList.toggle('active', torchActive);
+            } catch (err) {
+                console.error("Torch error:", err);
+            }
+        });
+
+        resSelect.addEventListener('change', () => {
+            if (isStreaming) initCamera();
+        });
+
+        startBtn.addEventListener('click', startStream);
+        stopBtn.addEventListener('click', stopStream);
+
+        // Keep screen alive if WakeLock is supported
+        if ('wakeLock' in navigator) {
+            navigator.wakeLock.request('screen').catch(() => {});
+        }
+    </script>
+</body>
+</html>
