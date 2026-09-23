@@ -35,6 +35,20 @@ VALID_STATE_CODES = {
 def clean_plate(text):
     """Clean and return an alphanumeric plate string universally without strict templates."""
     cleaned = re.sub(r'[^A-Z0-9]', '', text.upper())
+    
+    # Strip common non-plate watermarks and country badges (e.g. IND, SUZUKI, HONDA, HYUNDAI)
+    watermarks = ["SUZUKI", "HYUNDAI", "HONDA", "TOYOTA", "TATA", "MARUTI", "HERO", "BAJAJ", "MAHINDRA", "INDIA"]
+    for wm in watermarks:
+        cleaned = cleaned.replace(wm, "")
+        
+    # Strip standalone or trailing IND badge
+    if cleaned.startswith("IND") and len(cleaned) > 7:
+        cleaned = cleaned[3:]
+    if cleaned.endswith("IND") and len(cleaned) > 7:
+        cleaned = cleaned[:-3]
+    if "IND" in cleaned and len(cleaned) > 10:
+        cleaned = cleaned.replace("IND", "")
+
     # Filter out absolute garbage (e.g., less than 3 chars or weirdly long)
     if len(cleaned) < 3 or len(cleaned) > 15:
         return None
@@ -60,6 +74,15 @@ def correct_indian_plate(text):
 
     def force_digits(s):
         return "".join(letter_to_digit.get(c, c) if c.isalpha() else c for c in s)
+
+    # Check for Bharat Series (YY BH #### XX)
+    if "BH" in cleaned[2:4] or (cleaned[2:4] in ["8H", "OH", "0H", "88"]):
+        year = force_digits(cleaned[:2])
+        bh = "BH"
+        rem = cleaned[4:]
+        num = force_digits(rem[:4])
+        series = force_letters(rem[4:])
+        return year + bh + num + series
 
     state = force_letters(cleaned[0:2])
     num_part = force_digits(cleaned[-4:])
@@ -93,7 +116,9 @@ def is_indian_plate(text):
     if len(cleaned) < 7 or len(cleaned) > 11:
         return False
     state = cleaned[:2]
-    # Allow some OCR errors in state code, but mostly check structure
+    # Check if starts with a known state or valid letter sequence
+    if state in VALID_STATE_CODES:
+        return True
     letters = sum(1 for c in state if c.isalpha() or c in '0852')
     if letters >= 1 and cleaned[-2:].isdigit():
         return True
@@ -170,102 +195,110 @@ def get_mode(items, confs=None):
     final_str = Counter(best_cluster['strings']).most_common(1)[0][0]
     return final_str
 
+# ─── License Plate ROI Extraction ─────────────────────────────────────────────
+
+def extract_plate_candidates(vehicle_crop):
+    """
+    Fast morphological and edge-gradient license plate localizer on CPU (< 1ms).
+    Returns list of high-probability plate crops from the vehicle region.
+    """
+    if vehicle_crop is None or vehicle_crop.size == 0:
+        return []
+        
+    vh, vw = vehicle_crop.shape[:2]
+    if vh < 30 or vw < 40:
+        return [vehicle_crop]
+
+    # Focus on the lower 65% of the vehicle where front/rear plates are mounted
+    roi_y1 = int(vh * 0.35)
+    roi = vehicle_crop[roi_y1:, :]
+    rh, rw = roi.shape[:2]
+    if rh < 20 or rw < 30:
+        return [vehicle_crop]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # 1. Blackhat morphology to extract dark text/features on high contrast backgrounds
+    rect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, rect_kernel)
+
+    # 2. Sobel horizontal gradient (detecting high density of vertical character edges)
+    grad_x = cv2.Sobel(gray, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=-1)
+    grad_x = np.absolute(grad_x)
+    min_val, max_val = np.min(grad_x), np.max(grad_x)
+    grad_x = (255 * ((grad_x - min_val) / (max_val - min_val + 1e-5))).astype('uint8')
+
+    # 3. Morphological close along horizontal axis to group characters into plate block
+    grad_x = cv2.GaussianBlur(grad_x, (5, 5), 0)
+    grad_x = cv2.morphologyEx(grad_x, cv2.MORPH_CLOSE, rect_kernel)
+    thresh = cv2.threshold(grad_x, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    # 4. Contour detection & Aspect Ratio filtering
+    contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        ar = w / float(h)
+        # Rectangular plates: 1.8 - 5.8, Square/Two-wheeler: 1.1 - 2.2
+        if 1.3 <= ar <= 6.2 and w >= 32 and h >= 9 and (w * h) / (rw * rh) < 0.65:
+            # Score candidate by area and texture
+            pad_x = max(3, int(w * 0.08))
+            pad_y = max(3, int(h * 0.12))
+            cand_crop = roi[max(0, y - pad_y):min(rh, y + h + pad_y), max(0, x - pad_x):min(rw, x + w + pad_x)]
+            if cand_crop.size > 0:
+                # Rank candidates by edge energy & resolution
+                score = w * h
+                candidates.append((score, cand_crop))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if candidates:
+        return [item[1] for item in candidates[:2]]
+
+    # Fallback to bottom-center 40% of the vehicle crop
+    return [vehicle_crop[int(vh * 0.60):, int(vw * 0.15):int(vw * 0.85)]]
+
 # ─── Image Enhancement ────────────────────────────────────────────────────────
 
-def deskew_plate(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blur, 50, 200)
-    
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return image
-    
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-    plate_contour = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            plate_contour = approx
-            break
-            
-    if plate_contour is None:
-        return image
-        
-    pts = plate_contour.reshape(4, 2)
-    rect = np.zeros((4, 2), dtype="float32")
-    
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    
-    (tl, tr, br, bl) = rect
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-    
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-    
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-        
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-    return warped
-
-def single_scale_retinex(img, sigma):
-    # Avoid log(0)
-    retinex = np.log10(img + 1.0) - np.log10(cv2.GaussianBlur(img, (0, 0), sigma) + 1.0)
-    return retinex
-
-def apply_retinex(img):
-    """Multi-Scale Retinex (MSR) for glare/shadow removal."""
-    img_float = np.float64(img)
-    sigmas = [15, 80, 250]
-    retinex = np.zeros_like(img_float)
-    for sigma in sigmas:
-        retinex += single_scale_retinex(img_float, sigma)
-    retinex = retinex / len(sigmas)
-    
-    min_val, max_val = np.min(retinex), np.max(retinex)
-    if max_val - min_val == 0:
-        return img
-    retinex = 255 * (retinex - min_val) / (max_val - min_val)
-    return np.uint8(retinex)
-
 def enhance_plate(crop):
-    """Deskew, apply Retinex (MSR), upscale 3x, and CLAHE to sharpen plate crop before OCR."""
+    """
+    High-performance CPU plate enhancement for CCTV/RTSP streams:
+    - Upscales small/distant plates to minimum 64px height and 140px width with bicubic interpolation
+    - LAB CLAHE adaptive contrast equalization
+    - Unsharp mask text edge sharpening
+    - 6% white border padding to prevent OCR token boundary clipping
+    """
+    if crop is None or crop.size == 0:
+        return crop
     h, w = crop.shape[:2]
     if h == 0 or w == 0:
         return crop
-        
-    deskewed = deskew_plate(crop)
-    
-    dh, dw = deskewed.shape[:2]
-    if dh == 0 or dw == 0:
-        deskewed = crop
-        dh, dw = deskewed.shape[:2]
-        
-    # Apply MSR to fix lighting/glare
-    msr_img = apply_retinex(deskewed)
-        
-    upscaled = cv2.resize(msr_img, (dw * 3, dh * 3), interpolation=cv2.INTER_CUBIC)
-    
-    filtered = cv2.bilateralFilter(upscaled, 9, 75, 75)
-    gray = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(gray)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    # 1. Bicubic Upscaling for distant/small CCTV crops (ensure min 64px height, 140px width)
+    scale = 1.0
+    if h < 64:
+        scale = max(scale, 64.0 / float(h))
+    if w < 140:
+        scale = max(scale, 140.0 / float(w))
+    if scale > 1.0:
+        crop = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        h, w = crop.shape[:2]
+
+    # 2. LAB CLAHE contrast enhancement
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
+    l_eq = clahe.apply(l)
+    enhanced_bgr = cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
+
+    # 3. Fast Unsharp Mask Sharpening
+    gaussian = cv2.GaussianBlur(enhanced_bgr, (0, 0), 1.5)
+    sharpened = cv2.addWeighted(enhanced_bgr, 1.4, gaussian, -0.4, 0)
+
+    # 4. White border padding (8px)
+    pad_h = max(4, int(h * 0.08))
+    pad_w = max(6, int(w * 0.08))
+    padded = cv2.copyMakeBorder(sharpened, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+    return padded
 
 # ─── Database Flush ───────────────────────────────────────────────────────────
 

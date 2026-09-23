@@ -30,27 +30,100 @@ venv/
 env/
 .env/
 
-# Environment variables
+# Node & Frontend
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables & Credentials / Certificates
 .env
 .env.local
+*.pem
+*.key
+*.crt
+*.cert
+cert.pem
+key.pem
 
-# IDEs
+# IDEs & Operating Systems
 .vscode/
 .idea/
-
-# macOS
 .DS_Store
+desktop.ini
+Thumbs.db
+ehthumbs.db
 
-# Data/Video Files
+# Video Files & Test Streams
 *.mp4
 *.avi
 *.mov
 *.mkv
+*.flv
+*.wmv
+*.webm
+*.m4v
+*.ts
+*.h264
+*.264
+videos/
+test_videos/
+recordings/
+
+# Image Files & Test Crops
 *.jpg
 *.jpeg
 *.png
+*.bmp
+*.webp
+*.tiff
+*.tif
+*.gif
+*.ico
+test_images/
+test_crops/
+crops/
+input_*.png
+input_*.jpg
+crop_*.png
+test_crop*.png
+anpr_*_clean.png
+anpr_annotated_output.png
+# Keep dashboard UI screenshots if needed
+!dashboard/*.png
+!dashboard/**/*.png
+
+# Datasets & Annotations
+datasets/
+dataset/
+data/
+Annotations/
+annotations/
+2016-ITS-BrnoCompSpeed/
+Indian_Number_Plates/
+number_plate_annos_ocr/
+number_plate_images_ocr/
+perfect_indian_license_plates/
+*.xml
+
+# Models & Weights
 *.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+*.bin
+*.safetensors
+models/
+runs/
+weights/
 
-
-models
-
+# Databases, Cache & Logs
+*.db
+*.sqlite
+*.sqlite3
+traffic.db
+*.log
+results/
+outputs/

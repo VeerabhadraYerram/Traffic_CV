@@ -36,13 +36,13 @@ services:
       - db
 
     # Uncomment this block below to run on NVIDIA GPUs natively (60+ FPS):
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [ gpu ]
 
   web:
     build: .

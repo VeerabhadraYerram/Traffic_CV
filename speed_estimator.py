@@ -4,28 +4,28 @@ import collections
 import time
 
 class SpeedEstimator:
-    def __init__(self, polygon_normalized, distance_meters, frame_width, frame_height, window_size=15):
+    def __init__(self, polygon_normalized, distance_meters, frame_width, frame_height, window_size=12):
         """
         Initializes the SpeedEstimator.
-        polygon_normalized: List of 4 points in normalized coordinates, e.g.,
-                            [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}, {"x": 1.0, "y": 0.9}, {"x": 0.0, "y": 0.9}]
-                            (top-left, top-right, bottom-right, bottom-left)
+        polygon_normalized: List of 4 points in normalized coordinates (top-left, top-right, bottom-right, bottom-left)
         distance_meters: Physical length of the polygon (top to bottom).
         """
-        self.distance_meters = distance_meters
+        self.distance_meters = float(distance_meters) if distance_meters else 15.0
         self.lane_width_meters = 3.5
         self.frame_width = frame_width
         self.frame_height = frame_height
         
         self.src_points = self._parse_polygon(polygon_normalized)
-        
         self.homography_matrix = None
         if self.src_points is not None and len(self.src_points) == 4 and self.distance_meters > 0:
             self.homography_matrix = self._calculate_homography()
             
-        # Store history of positions for smoothing
-        self.track_history = {} # tracker_id -> deque of (timestamp, rw_x, rw_y)
+        # State tracking: tracker_id -> deque of (timestamp, smoothed_rw_x, smoothed_rw_y)
+        self.track_history = {}
+        # Track smoothed instantaneous speed: tracker_id -> float
+        self.speed_history = {}
         self.window_size = window_size
+        self.coord_ema_alpha = 0.6  # Coordinate smoothing factor
 
     def _parse_polygon(self, poly):
         if not poly or not isinstance(poly, list) or len(poly) != 4:
@@ -40,11 +40,9 @@ class SpeedEstimator:
             return None
 
     def _calculate_homography(self):
-        # We create a top-down projection space where 1 meter = 10 pixels
+        # Top-down projection space (1 meter = 10 pixels)
         scale = 10.0
         projected_height = self.distance_meters * scale
-        
-        # Use standard lane width instead of assuming the box is a square
         projected_width = self.lane_width_meters * scale
         
         dst_points = np.array([
@@ -55,62 +53,76 @@ class SpeedEstimator:
         ], dtype=np.float32)
         
         M, _ = cv2.findHomography(self.src_points, dst_points)
-        print(f"[DEBUG] _calculate_homography: M={M}")
         return M
 
     def update_and_get_speed(self, tracker_id, bottom_center, current_time=None):
         """
-        Updates the history for a tracker_id and returns the smoothed instantaneous speed in km/h.
+        Updates tracking history for a vehicle and returns precision smoothed speed in km/h.
         """
         if self.homography_matrix is None:
-            print(f"[DEBUG] homography_matrix is None!")
             return 0.0
             
         if current_time is None:
             current_time = time.time()
             
-        if tracker_id not in self.track_history:
-            self.track_history[tracker_id] = collections.deque(maxlen=self.window_size)
-            
         x, y = bottom_center
-        # Transform pixel (x,y) to real-world (rw_x, rw_y) via perspective matrix
+        # Transform pixel coordinate to ground plane via Homography
         pt = np.array([[[x, y]]], dtype=np.float32)
         transformed = cv2.perspectiveTransform(pt, self.homography_matrix)
-        rw_x, rw_y = transformed[0][0]
+        raw_rw_x = transformed[0][0][0] / 10.0
+        raw_rw_y = transformed[0][0][1] / 10.0
         
-        # Convert out of projected scale back to actual meters
-        rw_x_meters = rw_x / 10.0
-        rw_y_meters = rw_y / 10.0
-        
-        self.track_history[tracker_id].append((current_time, rw_x_meters, rw_y_meters))
+        # Initialize or retrieve history
+        if tracker_id not in self.track_history:
+            self.track_history[tracker_id] = collections.deque(maxlen=self.window_size)
+            smooth_x, smooth_y = raw_rw_x, raw_rw_y
+        else:
+            prev_time, prev_x, prev_y = self.track_history[tracker_id][-1]
+            # EMA coordinate smoothing to kill single-frame bounding box jitter
+            smooth_x = self.coord_ema_alpha * raw_rw_x + (1.0 - self.coord_ema_alpha) * prev_x
+            smooth_y = self.coord_ema_alpha * raw_rw_y + (1.0 - self.coord_ema_alpha) * prev_y
+            
+        self.track_history[tracker_id].append((current_time, smooth_x, smooth_y))
         
         history = self.track_history[tracker_id]
-        if len(history) < 5:  # Need at least 5 frames of history to calculate a stable speed
-            return 0.0
+        if len(history) < 4:
+            return self.speed_history.get(tracker_id, 0.0)
             
-        oldest_time, _, _ = history[0]
-        newest_time, _, _ = history[-1]
+        # Calculate velocity over the rolling window
+        oldest_time, ox, oy = history[0]
+        newest_time, nx, ny = history[-1]
         
         dt = newest_time - oldest_time
-        if dt <= 0.01:
-            print(f"[DEBUG] dt <= 0.01: {dt}")
-            return 0.0
+        if dt < 0.05:
+            return self.speed_history.get(tracker_id, 0.0)
             
-        # Calculate cumulative displacement along the curved path
-        distance = 0.0
-        for i in range(1, len(history)):
-            _, px, py = history[i-1]
-            _, cx, cy = history[i]
-            distance += np.sqrt((cx - px)**2 + (cy - py)**2)
+        # Vector displacement (net distance along ground plane)
+        dx = nx - ox
+        dy = ny - oy
+        displacement = np.sqrt(dx * dx + dy * dy)
         
-        speed_mps = distance / dt
-        speed_kmh = speed_mps * 3.6
-        if speed_kmh == 0.0:
-            print(f"[DEBUG] speed is exactly 0.0. distance: {distance}, len(history): {len(history)}, coords: {history[-2]} -> {history[-1]}")
-        return speed_kmh
+        raw_speed_mps = displacement / dt
+        raw_speed_kmh = raw_speed_mps * 3.6
+        
+        # Stationary filter: below 1.8 km/h is considered stopped / detector jitter
+        if raw_speed_kmh < 1.8:
+            raw_speed_kmh = 0.0
+            
+        # Exponential smoothing on the reported speed
+        prev_reported = self.speed_history.get(tracker_id, raw_speed_kmh)
+        # Outlier spike suppression (cap unrealistic instantaneous acceleration > 40 km/h jump)
+        if abs(raw_speed_kmh - prev_reported) > 35.0 and prev_reported > 0:
+            raw_speed_kmh = prev_reported + (35.0 if raw_speed_kmh > prev_reported else -35.0)
+            
+        smoothed_speed = 0.45 * raw_speed_kmh + 0.55 * prev_reported
+        self.speed_history[tracker_id] = round(smoothed_speed, 1)
+        return self.speed_history[tracker_id]
 
     def clean_stale_trackers(self, active_tracker_ids):
         """Removes history for trackers that are no longer active to prevent memory leaks."""
-        stale = [tid for tid in self.track_history if tid not in active_tracker_ids]
+        active_set = set(active_tracker_ids)
+        stale = [tid for tid in self.track_history if tid not in active_set]
         for tid in stale:
             del self.track_history[tid]
+            if tid in self.speed_history:
+                del self.speed_history[tid]

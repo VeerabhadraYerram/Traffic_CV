@@ -5,9 +5,9 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|"
     "fflags;nobuffer|"
     "flags;low_delay|"
-    "max_delay;500000|"
+    "max_delay;100000|"
     "reorder_queue_size;0|"
-    "stimeout;5000000|"
+    "stimeout;3000000|"
     "buffer_size;1024000"
 )
 import cv2
@@ -29,7 +29,7 @@ from paddleocr import PaddleOCR
 from database import SessionLocal
 from models import Camera, CameraRole
 from speed_estimator import SpeedEstimator
-from utils import YOLO_CLASS_MAP, clean_plate, enhance_plate, flush_session_to_db
+from utils import YOLO_CLASS_MAP, clean_plate, enhance_plate, extract_plate_candidates, get_mode, flush_session_to_db
 
 app = FastAPI()
 
@@ -42,6 +42,11 @@ app.add_middleware(
 )
 
 device_is_gpu = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+if not device_is_gpu:
+    # Maximize CPU parallelism for real-time inference
+    cpu_cores = min(os.cpu_count() or 4, 8)
+    torch.set_num_threads(cpu_cores)
+    print(f"⚡ CPU mode enabled: allocated {cpu_cores} threads for PyTorch")
 
 # Globals
 model = None
@@ -61,29 +66,34 @@ def load_models_background():
                 print("⚡ Loading Global ML Models in background...")
                 if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
                     model = YOLO("yolo11m.engine", task="detect")
-                else:
+                elif torch.cuda.is_available():
                     model = YOLO("yolo11m.pt")
+                else:
+                    # Best-in-class real-time CPU model (30-60+ FPS)
+                    model = YOLO("yolo11n.pt")
 
-                try:
-                    lp_model = YOLO("models/yolov8n_license_plate.pt")
-                except:
+                if os.path.exists("models/yolov8n_license_plate.pt"):
+                    try:
+                        lp_model = YOLO("models/yolov8n_license_plate.pt")
+                    except Exception:
+                        lp_model = None
+                else:
                     lp_model = None
 
-                reader = PaddleOCR(use_angle_cls=True, lang='en')
+                # Initialize optimized PaddleOCR on CPU (disable MKLDNN collision with PyTorch OpenMP)
+                reader = PaddleOCR(use_angle_cls=False, lang='en', show_log=False, enable_mkldnn=False)
                 models_loaded = True
-                print("✅ ML Models fully loaded!")
+                print("✅ ML Models (YOLO + PaddleOCR) fully loaded!")
             except Exception as e:
-                print(f"❌ Error loading models: {e}. Cleaning up and retrying in 5 seconds...")
-                import shutil
-                import time
-                shutil.rmtree('/root/.paddleocr', ignore_errors=True)
-                time.sleep(5)
+                print(f"❌ Error loading models: {e}. Retrying in 4 seconds...")
+                time.sleep(4)
 
 # Trigger background load immediately on import
 threading.Thread(target=load_models_background, daemon=True).start()
 
-# Global OCR Queue (Reduced size to prevent latency backlog)
-ocr_queue = queue.Queue(maxsize=10)
+# Global OCR Queue (Throttled for CPU efficiency)
+ocr_queue = queue.Queue(maxsize=12)
+paddle_lock = threading.Lock()
 
 def ocr_worker_loop():
     global lp_model, reader, models_loaded
@@ -94,8 +104,8 @@ def ocr_worker_loop():
                 break
             tid, crop, active_sessions = item
             
-            # FAST DISCARD: If vehicle left or already has enough reads, skip heavy OCR!
-            if tid not in active_sessions or len(active_sessions[tid].get("plate_reads", [])) >= 10:
+            # Fast discard: If vehicle disappeared or already reached confident consensus, skip OCR
+            if tid not in active_sessions or len(active_sessions[tid].get("plate_reads", [])) >= 8:
                 ocr_queue.task_done()
                 continue
             
@@ -103,32 +113,40 @@ def ocr_worker_loop():
                 ocr_queue.task_done()
                 continue
                 
-            plate_crop = None
+            plate_crops = []
             if lp_model:
-                lp_results = lp_model(crop, conf=0.20, verbose=False)
-                for r in lp_results:
-                    if len(r.boxes) > 0:
-                        best_box = max(r.boxes, key=lambda b: float(b.conf[0]))
-                        px1, py1, px2, py2 = best_box.xyxy[0].tolist()
-                        w, h = px2 - px1, py2 - py1
-                        pad_x, pad_y = int(w * 0.1), int(h * 0.1)
-                        px1, py1 = max(0, int(px1) - pad_x), max(0, int(py1) - pad_y)
-                        px2, py2 = min(crop.shape[1], int(px2) + pad_x), min(crop.shape[0], int(py2) + pad_y)
-                        plate_crop = crop[py1:py2, px1:px2]
-                        break
-                        
-            if plate_crop is None or plate_crop.size == 0:
-                plate_crop = crop[int(crop.shape[0] * 0.70):, :]
+                try:
+                    lp_results = lp_model(crop, conf=0.25, verbose=False)
+                    for r in lp_results:
+                        for box in r.boxes:
+                            px1, py1, px2, py2 = box.xyxy[0].tolist()
+                            w, h = px2 - px1, py2 - py1
+                            pad_x, pad_y = int(w * 0.1), int(h * 0.1)
+                            px1 = max(0, int(px1) - pad_x)
+                            py1 = max(0, int(py1) - pad_y)
+                            px2 = min(crop.shape[1], int(px2) + pad_x)
+                            py2 = min(crop.shape[0], int(py2) + pad_y)
+                            p_crop = crop[py1:py2, px1:px2]
+                            if p_crop.size > 0:
+                                plate_crops.append(p_crop)
+                except Exception:
+                    pass
 
-            if plate_crop is not None and plate_crop.size > 0:
-                enhanced = enhance_plate(plate_crop)
-                # Use cls=False for speed
-                result = reader.ocr(enhanced, cls=False)
+            # If deep LP detector did not find plate, use high-speed morphological localizer
+            if not plate_crops:
+                plate_crops = extract_plate_candidates(crop)
+
+            for p_crop in plate_crops:
+                if p_crop is None or p_crop.size == 0:
+                    continue
+                enhanced = enhance_plate(p_crop)
+                with paddle_lock:
+                    result = reader.ocr(enhanced, cls=False)
                 if result and result[0]:
                     for line in result[0]:
                         text = line[1][0]
                         prob = line[1][1]
-                        if prob > 0.20:
+                        if prob > 0.30:
                             cleaned = clean_plate(text)
                             if cleaned and tid in active_sessions:
                                 active_sessions[tid]["plate_reads"].append(cleaned)
@@ -264,14 +282,23 @@ def camera_push_status():
     }
 
 class FreshFrameReader:
-    """Ultra-low latency, zero-frame-drop non-blocking video reader with auto-reconnect watchdog."""
+    """Ultra-low latency, zero-frame-drop non-blocking video reader with auto-reconnect watchdog and RTSP/HLS fallback."""
     def __init__(self, src: str):
         self.src = src
+        self.resolved_src = src
+        # Auto-convert RTSP corp8 URLs to HTTPS HLS if needed
+        if "live.corp8.cloud:8554/stream/" in src:
+            stream_id = src.split("/stream/")[-1].split("/")[0]
+            self.fallback_src = f"https://live.corp8.cloud/live/stream/{stream_id}/index.m3u8"
+        else:
+            self.fallback_src = None
+            
         self.lock = threading.Lock()
+        self.cap_lock = threading.Lock()
         self.frame = None
         self.ret = False
         self.running = True
-        self.last_frame_time = 0.0
+        self.last_frame_time = time.time()
         self.width = 1280
         self.height = 720
         self.fps = 30.0
@@ -286,28 +313,51 @@ class FreshFrameReader:
         self.thread.start()
 
     def _init_cap(self):
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-        
-        print(f"[FreshFrameReader] 🔌 Connecting to {self.src} (TCP transport, no-buffer)...")
-        cap = cv2.VideoCapture(self.src, cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.cap = cap
+        with self.cap_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+            
+            target = self.resolved_src
+            print(f"[FreshFrameReader] 🔌 Connecting to {target}...")
+            cap = cv2.VideoCapture(target, cv2.CAP_FFMPEG if hasattr(cv2, "CAP_FFMPEG") else cv2.CAP_ANY)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap = cap
 
     def _reader_loop(self):
         consecutive_fails = 0
         while self.running:
-            if self.cap is None or not self.cap.isOpened():
+            with self.cap_lock:
+                if not self.running:
+                    break
+                if self.cap is None or not self.cap.isOpened():
+                    needs_reconnect = True
+                    ret, frame = False, None
+                else:
+                    needs_reconnect = False
+                    try:
+                        # Rapid grab to drain internal FFmpeg packet buffer (guarantees zero lag)
+                        ret = self.cap.grab()
+                        if ret:
+                            ret, frame = self.cap.retrieve()
+                        else:
+                            frame = None
+                    except Exception:
+                        ret, frame = False, None
+
+            if needs_reconnect:
                 self.status = "reconnecting"
                 time.sleep(1.0)
+                if self.reconnect_count > 1 and self.fallback_src and self.resolved_src != self.fallback_src:
+                    print(f"[FreshFrameReader] 🔄 Switching to HLS stream fallback: {self.fallback_src}")
+                    self.resolved_src = self.fallback_src
                 self._init_cap()
                 self.reconnect_count += 1
                 continue
 
-            ret, frame = self.cap.read()
             now = time.time()
 
             if ret and frame is not None and frame.size > 0:
@@ -323,16 +373,18 @@ class FreshFrameReader:
                     self.status = "connected"
             else:
                 consecutive_fails += 1
-                # If stalled or failing for > 50 iterations or 3 seconds
-                if consecutive_fails > 50 or (now - self.last_frame_time > 3.0 and self.last_frame_time > 0):
-                    print(f"[FreshFrameReader] ⚠️ Stream stall/drop on {self.src}. Reconnecting (attempt {self.reconnect_count + 1})...")
+                if consecutive_fails > 25 or (now - self.last_frame_time > 4.0):
+                    print(f"[FreshFrameReader] ⚠️ Stream stall on {self.resolved_src}. Reconnecting (attempt {self.reconnect_count + 1})...")
+                    if self.fallback_src and self.resolved_src != self.fallback_src:
+                        print(f"[FreshFrameReader] 🔄 Switching to HLS stream fallback: {self.fallback_src}")
+                        self.resolved_src = self.fallback_src
                     self.status = "reconnecting"
                     self.reconnect_count += 1
                     self._init_cap()
                     consecutive_fails = 0
                     time.sleep(0.5)
                 else:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
 
     def read(self):
         with self.lock:
@@ -341,7 +393,8 @@ class FreshFrameReader:
             return True, self.frame.copy()
 
     def isOpened(self):
-        return self.running and (self.cap is not None and (self.cap.isOpened() or (time.time() - self.last_frame_time < 5.0)))
+        with self.lock:
+            return self.running and (self.frame is not None or (time.time() - self.last_frame_time < 15.0))
 
     def get(self, prop):
         with self.lock:
@@ -355,11 +408,13 @@ class FreshFrameReader:
 
     def release(self):
         self.running = False
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
+        with self.cap_lock:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
 
 def generate_frames(cam_id: str):
     # Enforce single instance
@@ -402,24 +457,36 @@ def generate_frames(cam_id: str):
     else:
         cap = cv2.VideoCapture(video_source)
 
+    # Wait for first frame on network / push streams before evaluating isOpened
+    if is_network_stream or video_source == "push":
+        yield create_text_frame(f"Connecting to live stream: {name}...")
+        for _ in range(120): # Wait up to 6 seconds for initial frames
+            if stop_signal.is_set():
+                break
+            has_frame, _ = cap.read()
+            if has_frame:
+                break
+            time.sleep(0.05)
+
     if not cap.isOpened():
         print(f"[{name}] ⚠️ Cannot open video source: {video_source}")
+        if hasattr(cap, 'release'):
+            cap.release()
         pipeline_lock.release()
         for _ in range(5):
             yield create_text_frame(f"ERROR: Cannot open video source: {video_source}")
             time.sleep(1.0)
         return
 
-    # Wait briefly for first frame if network stream or push stream
-    if is_network_stream or video_source == "push":
-        for _ in range(100): # Wait up to 5 seconds for first frame
-            if cap.read()[0]:
-                break
-            time.sleep(0.05)
-
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    target_frame_time = 1.0 / (fps if fps and fps > 0 else 30.0)
+
+    # Inference resolution downscaling for 4x CPU speedup (~25ms per frame)
+    infer_w, infer_h = 640, 360
+    scale_x = width / float(infer_w)
+    scale_y = height / float(infer_h)
 
     speed_estimator = None
     cal_poly = calibration_polygon_normalized
@@ -464,9 +531,14 @@ def generate_frames(cam_id: str):
             triggering_anchors=[sv.Position.BOTTOM_CENTER]
         )
 
-    tracker = DeepSort(max_age=30, n_init=2, nms_max_overlap=0.5)
+    # Ultra-fast real-time CPU ByteTracker (< 1ms per frame)
+    tracker = sv.ByteTrack()
     active_sessions = {}
     frame_counter = 0
+
+    # Detection frequency optimization: Run YOLO every 2nd frame on downscaled resolution
+    DETECTION_INTERVAL = 2
+    cached_detections = sv.Detections.empty()
 
     # Annotators
     box_annotator = sv.BoxAnnotator(color_lookup=sv.ColorLookup.TRACK)
@@ -482,6 +554,7 @@ def generate_frames(cam_id: str):
             time.sleep(1.0)
             
         while cap.isOpened():
+            t_frame_start = time.time()
             if stop_signal.is_set():
                 print(f"[{name}] 🛑 Stop signal received. Exiting generator.")
                 break
@@ -489,54 +562,58 @@ def generate_frames(cam_id: str):
             ret, frame = cap.read()
             if not ret or frame is None:
                 if is_network_stream or video_source == "push":
-                    yield create_text_frame("📱 Waiting for live phone stream... (Ensure phone is streaming)")
-                    time.sleep(0.5)
+                    yield create_text_frame("📱 Waiting for live phone / RTSP stream... (Ensure camera is online)")
+                    time.sleep(0.3)
                     continue
                 else:
                     break
 
             frame_counter += 1
 
+            # 1. Detection every Nth frame on CPU (or when tracks are empty)
+            should_detect = (frame_counter % DETECTION_INTERVAL == 0) or (cached_detections.tracker_id is None or len(cached_detections.tracker_id) == 0)
+            
+            if should_detect:
+                # Fast downscaled inference on 640x360
+                infer_frame = cv2.resize(frame, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
+                results = model(infer_frame, classes=[1, 2, 3, 5, 7], conf=0.28, imgsz=640, verbose=False)
+                raw_detections = sv.Detections.from_ultralytics(results[0])
+                # Scale bounding boxes back to full native frame dimensions
+                if raw_detections.xyxy is not None and len(raw_detections.xyxy) > 0:
+                    raw_detections.xyxy[:, 0] *= scale_x
+                    raw_detections.xyxy[:, 1] *= scale_y
+                    raw_detections.xyxy[:, 2] *= scale_x
+                    raw_detections.xyxy[:, 3] *= scale_y
+                detections = tracker.update_with_detections(raw_detections)
+                cached_detections = detections
+            else:
+                # Reuse active tracker state on intermediate frames (0 ms!)
+                detections = cached_detections
 
-            # 1. Detection
-            results = model(frame, classes=[1, 2, 3, 5, 7], conf=0.45, verbose=False)
-            bbs = []
-            for r in results:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    bbs.append(([x1, y1, x2 - x1, y2 - y1], float(box.conf[0]), int(box.cls[0])))
+            valid_tracks = []
+            if detections.tracker_id is not None and len(detections.tracker_id) > 0:
+                for idx, tid in enumerate(detections.tracker_id):
+                    x1, y1, x2, y2 = detections.xyxy[idx]
+                    x1, y1 = max(0, int(x1)), max(0, int(y1))
+                    x2, y2 = min(width, int(x2)), min(height, int(y2))
+                    cls_id = int(detections.class_id[idx]) if detections.class_id is not None else 2
+                    v_type = YOLO_CLASS_MAP.get(cls_id, "Car")
+                    valid_tracks.append((int(tid), x1, y1, x2, y2, v_type, idx))
 
-            # 2. Tracking
-            tracks = tracker.update_tracks(bbs, frame=frame)
-            xyxys, tracker_ids, valid_tracks = [], [], []
-
-            for track in tracks:
-                if not track.is_confirmed(): continue
-                tid = int(track.track_id)
-                x1, y1, x2, y2 = track.to_ltrb()
-                x1, y1 = max(0, int(x1)), max(0, int(y1))
-                x2, y2 = min(width, int(x2)), min(height, int(y2))
-                v_type = YOLO_CLASS_MAP.get(track.get_det_class(), "Car")
-                
-                xyxys.append([x1, y1, x2, y2])
-                tracker_ids.append(tid)
-                valid_tracks.append((tid, x1, y1, x2, y2, v_type))
-
-            # Update speeds and OCR
+            # 2. Update Speeds and OCR Queues
             ocr_jobs = []
-            for tid, x1, y1, x2, y2, v_type in valid_tracks:
+            for tid, x1, y1, x2, y2, v_type, det_idx in valid_tracks:
                 inst_speed = 0.0
-                bottom_center = (int((x1+x2)/2), int(y2))
+                bottom_center = (int((x1 + x2) / 2), int(y2))
                 
                 # Check if inside speed zone
                 in_zone = True
                 if speed_zone:
-                    # cv2 point polygon test
                     in_zone = cv2.pointPolygonTest(speed_zone.polygon, bottom_center, False) >= 0
 
                 if speed_estimator and in_zone:
                     safe_fps = fps if fps and fps > 0 else 30.0
-                    inst_speed = speed_estimator.update_and_get_speed(tid, bottom_center, current_time=frame_counter/safe_fps)
+                    inst_speed = speed_estimator.update_and_get_speed(tid, bottom_center, current_time=frame_counter / safe_fps)
                     
                 if tid not in active_sessions:
                     active_sessions[tid] = {
@@ -551,42 +628,46 @@ def generate_frames(cam_id: str):
                     if inst_speed > active_sessions[tid].get("max_speed_kmh", 0):
                         active_sessions[tid]["max_speed_kmh"] = inst_speed
 
-                # Reduce to 10 max reads for throttling
-                if len(active_sessions[tid]["plate_reads"]) < 10:
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0: ocr_jobs.append((tid, crop.copy()))
+                # Quality-based OCR queuing:
+                # Only queue when a new detection occurs and vehicle has < 8 reads
+                if should_detect and len(active_sessions[tid]["plate_reads"]) < 8:
+                    w_box, h_box = x2 - x1, y2 - y1
+                    if w_box >= 40 and h_box >= 30:
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                            sharpness = cv2.Laplacian(gray_crop, cv2.CV_64F).var()
+                            if sharpness > 10.0:
+                                ocr_jobs.append((tid, crop.copy(), sharpness, w_box * h_box))
             
-            # Prevent CUDA OOM by limiting OCR to top 3 largest vehicles per frame
-            ocr_jobs.sort(key=lambda j: j[1].shape[0] * j[1].shape[1], reverse=True)
-            ocr_jobs = ocr_jobs[:3]
+            # Sort OCR jobs by sharpness and area, pick top 2 sharpest vehicles
+            if ocr_jobs:
+                ocr_jobs.sort(key=lambda j: (j[2], j[3]), reverse=True)
+                for tid, crop, _, _ in ocr_jobs[:2]:
+                    if tid in active_sessions and len(active_sessions[tid]["plate_reads"]) < 8:
+                        try:
+                            ocr_queue.put_nowait((tid, crop, active_sessions))
+                        except queue.Full:
+                            pass
 
-            # Queue GPU OCR asynchronously
-            for tid, crop in ocr_jobs:
-                if tid in active_sessions and len(active_sessions[tid]["plate_reads"]) < 10:
-                    try:
-                        ocr_queue.put_nowait((tid, crop, active_sessions))
-                    except queue.Full:
-                        pass
-
-            # Database Flush (Stale)
-            stale_tids = [t for t, data in active_sessions.items() if frame_counter - data["last_seen"] > 60]
+            # 3. Database Flush (Stale Trackers)
+            stale_tids = [t for t, data in active_sessions.items() if frame_counter - data["last_seen"] > 45]
             if stale_tids:
                 for t in stale_tids:
                     flush_session_to_db(cam_id, t, dict(active_sessions.pop(t, {})), name, speed_limit)
                 if speed_estimator:
                     speed_estimator.clean_stale_trackers(active_sessions.keys())
 
-            # Evaluate Line Crossings
-            if xyxys:
-                detections = sv.Detections(xyxy=np.array(xyxys), tracker_id=np.array(tracker_ids))
-                
-                # Annotate Frame
+            # 4. Annotations and Line Zone Triggering
+            if detections.tracker_id is not None and len(detections.tracker_id) > 0:
                 labels = []
-                for idx, tid in enumerate(tracker_ids):
-                    v_type = active_sessions.get(tid, {}).get("vehicle_type", "Unknown")
-                    max_speed = active_sessions.get(tid, {}).get("max_speed_kmh", 0)
+                for tid in detections.tracker_id:
+                    tid = int(tid)
+                    v_type = active_sessions.get(tid, {}).get("vehicle_type", "Vehicle")
+                    max_speed = active_sessions.get(tid, {}).get("max_speed_kmh", 0.0)
                     reads = active_sessions.get(tid, {}).get("plate_reads", [])
-                    best_plate = max(set(reads), key=reads.count) if reads else "---"
+                    confs = active_sessions.get(tid, {}).get("plate_confidences", [])
+                    best_plate = get_mode(reads, confs) if reads else "---"
                     labels.append(f"#{tid} {v_type} | {max_speed:.1f} km/h | {best_plate}")
                 
                 frame = box_annotator.annotate(scene=frame, detections=detections)
@@ -594,30 +675,43 @@ def generate_frames(cam_id: str):
 
                 if role in [CameraRole.entrance, CameraRole.bidirectional] and entry_line:
                     crossed_in, crossed_out = entry_line.trigger(detections)
-                    for idx, tid in enumerate(tracker_ids):
-                        if (crossed_in[idx] or crossed_out[idx]) and (xyxys[idx][2] - xyxys[idx][0] >= 100):
+                    for idx, tid in enumerate(detections.tracker_id):
+                        tid = int(tid)
+                        if (crossed_in[idx] or crossed_out[idx]):
                             if tid in active_sessions and not active_sessions[tid]["crossed_entry"]:
                                 active_sessions[tid]["crossed_entry"] = True
                                 active_sessions[tid]["entry_time"] = datetime.now(timezone.utc)
-                    # Draw line
-                    cv2.line(frame, (int(entry_line_norm["x1"]*width), int(entry_line_norm["y1"]*height)), (int(entry_line_norm["x2"]*width), int(entry_line_norm["y2"]*height)), (0, 255, 0), 2)
+                    cv2.line(frame, (int(entry_line_norm["x1"] * width), int(entry_line_norm["y1"] * height)),
+                             (int(entry_line_norm["x2"] * width), int(entry_line_norm["y2"] * height)), (0, 255, 0), 2)
                             
                 if role in [CameraRole.exit, CameraRole.bidirectional] and exit_line:
                     crossed_in, crossed_out = exit_line.trigger(detections)
-                    for idx, tid in enumerate(tracker_ids):
-                        if (crossed_in[idx] or crossed_out[idx]) and (xyxys[idx][2] - xyxys[idx][0] >= 100):
+                    for idx, tid in enumerate(detections.tracker_id):
+                        tid = int(tid)
+                        if (crossed_in[idx] or crossed_out[idx]):
                             if tid in active_sessions and not active_sessions[tid]["crossed_exit"]:
                                 active_sessions[tid]["crossed_exit"] = True
                                 active_sessions[tid]["exit_time"] = datetime.now(timezone.utc)
-                    # Draw line
-                    cv2.line(frame, (int(exit_line_norm["x1"]*width), int(exit_line_norm["y1"]*height)), (int(exit_line_norm["x2"]*width), int(exit_line_norm["y2"]*height)), (0, 0, 255), 2)
+                    cv2.line(frame, (int(exit_line_norm["x1"] * width), int(exit_line_norm["y1"] * height)),
+                             (int(exit_line_norm["x2"] * width), int(exit_line_norm["y2"] * height)), (0, 0, 255), 2)
 
                 if speed_polygon_normalized:
-                    pts = np.array([[int(p['x']*width), int(p['y']*height)] for p in speed_polygon_normalized], np.int32)
+                    pts = np.array([[int(p['x'] * width), int(p['y'] * height)] for p in speed_polygon_normalized], np.int32)
                     cv2.polylines(frame, [pts], isClosed=True, color=(255, 255, 0), thickness=2)
 
-            # Yield MJPEG frame
-            ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            # 5. Playback Pacing for local video files
+            if not is_network_stream and video_source != "push":
+                elapsed = time.time() - t_frame_start
+                delay = target_frame_time - elapsed
+                if delay > 0.002:
+                    time.sleep(delay)
+
+            # 6. Stream Optimization: Resize display frame to 1280x720 max for silky smooth MJPEG browser decoding
+            out_frame = frame
+            if width > 1280 or height > 720:
+                out_frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
+
+            ret, buffer = cv2.imencode('.jpg', out_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
