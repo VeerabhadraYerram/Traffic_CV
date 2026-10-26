@@ -53,4 +53,7 @@ env/
 
 
 models
-
+*.log
+.paddleocr/
+*.onnx
+*.db

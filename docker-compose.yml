@@ -1,63 +1,72 @@
 services:
-  db:
-    image: postgres:15-alpine
-    container_name: traffic_db
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: adminpassword
-      POSTGRES_DB: traffic
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql
+  # UC4 ANPR Stream Analytics Worker (Approach 2 Integration)
+  uc4_anpr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: innovision/uc4-anpr:latest
+    container_name: innovision_uc4_anpr
+    restart: unless-stopped
+    command: python worker.py
+    env_file:
+      - .env
     ports:
-      - "5435:5432"
-
-  app:
-    build: .
-    container_name: traffic_pipeline
-    command: uvicorn pipeline_api:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
-    environment:
-      - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
-      - PYTHONUNBUFFERED=1
-    shm_size: '4gb'
+      - "8004:8004"  # Non-blocking health & dynamic config API
+    shm_size: "4gb"
     volumes:
-      # Map the local codebase for instant code reloads
       - ./:/app
-      # Universal video data mapping
-      - ./downloads:/app/downloads
-      # Persist EasyOCR models so it doesn't crash on DNS timeouts
-      - easyocr_models:/root/.EasyOCR/model
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-    depends_on:
-      - db
-
-    # Uncomment this block below to run on NVIDIA GPUs natively (60+ FPS):
+      - ./.paddleocr:/root/.paddleocr
+      - ./models:/app/models
+      - ./snapshots:/app/snapshots
+    networks:
+      - innovision_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [ gpu ]
+              capabilities: [gpu]
 
-  web:
-    build: .
-    container_name: traffic_web
-    command: uvicorn web_ui:app --host 0.0.0.0 --port 8000
-    environment:
-      - DATABASE_URL=postgresql://admin:adminpassword@db:5432/traffic
+  # Optional local services for development/testing (when platform stack is not active)
+  local_redis:
+    image: redis:7-alpine
+    container_name: uc4_local_redis
     ports:
-      - "8000:8000"
+      - "6379:6379"
+    networks:
+      - innovision_network
+    profiles:
+      - dev
+
+  local_db:
+    image: postgres:15-alpine
+    container_name: uc4_local_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: adminpassword
+      POSTGRES_DB: uc4_anpr
+    ports:
+      - "5435:5432"
     volumes:
-      - ./:/app
-      - ./downloads:/app/downloads
-    depends_on:
-      - db
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - innovision_network
+    profiles:
+      - dev
 
 volumes:
   postgres_data:
-  easyocr_models:
+
+networks:
+  innovision_network:
+    name: innovision_network
+    driver: bridge
+    attachable: true

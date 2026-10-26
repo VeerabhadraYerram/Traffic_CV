@@ -10,3 +10,7 @@ paddlepaddle==2.6.2
 fastapi
 uvicorn
 python-multipart
+redis[hiredis]>=5.0.0
+httpx>=0.27.0
+pydantic-settings>=2.0.0
+alembic>=1.13.0

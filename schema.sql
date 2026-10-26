@@ -1,43 +1,59 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-CREATE TYPE camera_role_enum AS ENUM ('entrance', 'exit', 'bidirectional', 'internal');
+DO $$ BEGIN
+    CREATE TYPE uc4_camera_role_enum AS ENUM ('entrance', 'exit', 'bidirectional', 'internal');
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
-CREATE TABLE cameras (
+-- 1. Local Camera Configuration Cache (dynamically populated from platform registry)
+CREATE TABLE IF NOT EXISTS uc4_camera_configs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    camera_id TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
-    video_source TEXT NOT NULL,
-    camera_role camera_role_enum NOT NULL,
+    video_source TEXT,
+    camera_role uc4_camera_role_enum DEFAULT 'bidirectional',
     entry_line_normalized JSONB,
     exit_line_normalized JSONB,
+    speed_polygon_normalized JSONB,
+    calibration_polygon_normalized JSONB,
+    distance_between_lines_meters DOUBLE PRECISION DEFAULT 15.0,
+    speed_limit_kmh INTEGER DEFAULT 30,
     is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    latitude DOUBLE PRECISION,
-    longitude DOUBLE PRECISION,
-    status TEXT DEFAULT 'ACTIVE',
-    ip_address TEXT,
-    speed_limit_kmh INTEGER DEFAULT 30
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE premise_access_logs (
+CREATE INDEX IF NOT EXISTS ix_uc4_camera_configs_cam_id ON uc4_camera_configs(camera_id);
+
+-- 2. Vehicle Access Logs (Definitive on-premise log of vehicle access)
+CREATE TABLE IF NOT EXISTS uc4_premise_access_logs (
     visit_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    camera_id UUID REFERENCES cameras(id),
+    camera_id TEXT NOT NULL,
     tracker_id INTEGER NOT NULL,
-    license_plate TEXT,
+    license_plate TEXT NOT NULL,
     entry_time TIMESTAMP WITH TIME ZONE NOT NULL,
     exit_time TIMESTAMP WITH TIME ZONE,
     duration_minutes NUMERIC,
-    is_active BOOLEAN DEFAULT TRUE,
-    ocr_confidence DOUBLE PRECISION,
+    ocr_confidence DOUBLE PRECISION DEFAULT 0.0,
     vehicle_type TEXT DEFAULT 'Car',
-    vehicle_color TEXT DEFAULT 'White',
-    image_url TEXT,
-    speed_kmh DOUBLE PRECISION,
-    is_violation BOOLEAN DEFAULT FALSE
+    vehicle_color TEXT DEFAULT 'Unknown',
+    speed_kmh DOUBLE PRECISION DEFAULT 0.0,
+    is_violation BOOLEAN DEFAULT FALSE,
+    snapshot_path TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE violations (
+CREATE INDEX IF NOT EXISTS ix_uc4_access_logs_cam_id ON uc4_premise_access_logs(camera_id);
+CREATE INDEX IF NOT EXISTS ix_uc4_access_logs_plate ON uc4_premise_access_logs(license_plate);
+CREATE INDEX IF NOT EXISTS ix_uc4_access_logs_entry ON uc4_premise_access_logs(entry_time);
+CREATE INDEX IF NOT EXISTS ix_uc4_access_cam_entry ON uc4_premise_access_logs(camera_id, entry_time);
+
+-- 3. Vehicle Violations (Speeding, Blacklisted plates)
+CREATE TABLE IF NOT EXISTS uc4_violations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    event_id UUID REFERENCES premise_access_logs(visit_id) ON DELETE CASCADE,
+    event_id UUID REFERENCES uc4_premise_access_logs(visit_id) ON DELETE CASCADE,
+    camera_id TEXT,
     license_plate TEXT NOT NULL,
     violation_type TEXT NOT NULL,
     recorded_value DOUBLE PRECISION,
@@ -47,14 +63,5 @@ CREATE TABLE violations (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Seed cameras matching VNR VJIET campus layout
-INSERT INTO cameras (id, name, video_source, camera_role, entry_line_normalized, exit_line_normalized, latitude, longitude, status, ip_address, speed_limit_kmh)
-VALUES 
-('a0e0a0a0-0000-0000-0000-000000000001', 'Main Entrance (Gate 1)', '/app/downloads/test_video.mp4', 'bidirectional', '{"x1": 0.0, "y1": 0.4268, "x2": 1.0, "y2": 0.4268}'::jsonb, '{"x1": 0.0, "y1": 0.6824, "x2": 1.0, "y2": 0.6824}'::jsonb, 17.5365, 78.3835, 'ACTIVE', '192.168.10.11', 30),
-('a0e0a0a0-0000-0000-0000-000000000002', 'Academic A-Block', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5375, 78.3842, 'ACTIVE', '192.168.10.12', 20),
-('a0e0a0a0-0000-0000-0000-000000000003', 'Library & CSE Block', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5383, 78.3838, 'ACTIVE', '192.168.10.13', 20),
-('a0e0a0a0-0000-0000-0000-000000000004', 'Central Canteen', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5392, 78.3832, 'ACTIVE', '192.168.10.14', 20),
-('a0e0a0a0-0000-0000-0000-000000000005', 'West Entrance (Gate 2)', '/app/downloads/test_video.mp4', 'bidirectional', NULL, NULL, 17.5380, 78.3810, 'ACTIVE', '192.168.10.15', 30),
-('a0e0a0a0-0000-0000-0000-000000000006', 'Main Parking Lot', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5371, 78.3820, 'ACTIVE', '192.168.10.16', 20),
-('a0e0a0a0-0000-0000-0000-000000000007', 'Sports Complex / Ground', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5401, 78.3844, 'MAINTENANCE', '192.168.10.17', 25),
-('a0e0a0a0-0000-0000-0000-000000000008', 'Research Park Gate', '/app/downloads/test_video.mp4', 'internal', NULL, NULL, 17.5388, 78.3846, 'OFFLINE', '192.168.10.18', 20);
+CREATE INDEX IF NOT EXISTS ix_uc4_violations_plate ON uc4_violations(license_plate);
+CREATE INDEX IF NOT EXISTS ix_uc4_violations_created ON uc4_violations(created_at);

@@ -4,16 +4,12 @@ import cv2
 import time
 import numpy as np
 import threading
-from datetime import datetime, timezone
-import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import supervision as sv
-from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
-from paddleocr import PaddleOCR
 
 from database import SessionLocal
 from models import Camera, CameraRole
@@ -29,20 +25,66 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-print("⚡ Loading Global ML Models...")
-if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
-    model = YOLO("yolo11m.engine", task="detect")
-else:
-    model = YOLO("yolo11m.pt")
+try:
+    import torch
+    from ultralytics import YOLO
+    print("[INFO] Loading Global ML Models via PyTorch...")
+    if torch.cuda.is_available() and os.path.exists("yolo11m.engine"):
+        model = YOLO("yolo11m.engine", task="detect")
+    else:
+        model = YOLO("yolo11m.pt")
+    device_is_gpu = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+except Exception as e:
+    print(f"[WARN] PyTorch/YOLO unavailable ({e}). Using OpenCV DNN ONNX fallback...")
+    device_is_gpu = False
+    class OnnxYoloWrapper:
+        def __init__(self, onnx_path):
+            self.net = cv2.dnn.readNetFromONNX(onnx_path) if os.path.exists(onnx_path) else None
+        def __call__(self, frame, classes=None, conf=0.35, verbose=False):
+            if self.net is None:
+                return []
+            h, w = frame.shape[:2]
+            blob = cv2.dnn.blobFromImage(frame, 1.0/255.0, (640, 640), swapRB=True, crop=False)
+            self.net.setInput(blob)
+            preds = self.net.forward()[0].transpose(1, 0)
+            boxes, confs, class_ids = [], [], []
+            for row in preds:
+                sc = row[4:]
+                cid = int(np.argmax(sc))
+                cf = float(sc[cid])
+                if cf > conf and (classes is None or cid in classes):
+                    cx, cy, bw, bh = row[0:4]
+                    bx = int((cx - bw / 2) * w)
+                    by = int((cy - bh / 2) * h)
+                    bw_p = int(bw * w)
+                    bh_p = int(bh * h)
+                    boxes.append([bx, by, bw_p, bh_p])
+                    confs.append(cf)
+                    class_ids.append(cid)
+            indices = cv2.dnn.NMSBoxes(boxes, confs, conf, 0.45)
+            class BoxItem:
+                def __init__(self, b, cf, cid):
+                    self.xyxy = [[b[0], b[1], b[0]+b[2], b[1]+b[3]]]
+                    self.conf = [cf]
+                    self.cls = [cid]
+            class ResultItem:
+                def __init__(self, boxes_list):
+                    self.boxes = boxes_list
+            res_boxes = [BoxItem(boxes[int(i)], confs[int(i)], class_ids[int(i)]) for i in indices]
+            return [ResultItem(res_boxes)]
+    model = OnnxYoloWrapper("models/yolov8n.onnx")
 
 try:
+    from ultralytics import YOLO
     lp_model = YOLO("models/yolov8n_license_plate.pt")
-except:
+except Exception:
     lp_model = None
 
-device_is_gpu = torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-reader = PaddleOCR(use_angle_cls=True, lang='en')
+try:
+    from paddleocr import PaddleOCR
+    reader = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+except Exception:
+    reader = None
 
 # Global lock for single-instance pipeline
 pipeline_lock = threading.Lock()
